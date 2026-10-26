@@ -1540,3 +1540,116 @@ func TestWaitForVolumePoolOp_ContextDeadline(t *testing.T) {
 		t.Errorf("waitForVolumePoolOp() returned after %v, want it to stop at the context deadline", elapsed)
 	}
 }
+
+func TestUpdateVolumePoolVolumeIpAcls(t *testing.T) {
+	name := "projects/test-project/locations/us-central1/volumePools/test-pool/volumes/vol-123"
+	nodeACL := VolumePoolNfsExportOptions{
+		IpRanges:   []string{"10.128.0.11"},
+		AccessMode: VolumePoolAccessModeReadWrite,
+		SquashMode: VolumePoolSquashModeNoRoot,
+	}
+
+	tests := []struct {
+		name         string
+		acls         []VolumePoolNfsExportOptions
+		responseCode int
+		responseBody string
+		wantBodyACLs string // the ipAcls JSON the request must carry
+		want         *PoolVolume
+		wantCode     codes.Code
+	}{
+		{
+			name:         "sets the IP ACLs",
+			acls:         []VolumePoolNfsExportOptions{nodeACL},
+			responseCode: http.StatusOK,
+			responseBody: fmt.Sprintf(`{"name": %q, "mountPoint": {"ipAddress": "10.0.0.2", "mountName": "vol_123"}, "state": "HOT", "ipAcls": [{"ipRanges": ["10.128.0.11"], "accessMode": "READ_WRITE", "squashMode": "NO_ROOT_SQUASH"}]}`, name),
+			wantBodyACLs: `[{"ipRanges":["10.128.0.11"],"accessMode":"READ_WRITE","squashMode":"NO_ROOT_SQUASH"}]`,
+			want:         &PoolVolume{Name: name, IpAddress: "10.0.0.2", MountName: "vol_123", State: VolumePoolVolumeStateHot, IpAcls: []VolumePoolNfsExportOptions{nodeACL}},
+		},
+		{
+			name:         "nil ACLs are sent as an empty list, which revokes all access",
+			acls:         nil,
+			responseCode: http.StatusOK,
+			responseBody: fmt.Sprintf(`{"name": %q, "mountPoint": {"ipAddress": "10.0.0.2", "mountName": "vol_123"}, "state": "HOT"}`, name),
+			wantBodyACLs: `[]`,
+			want:         &PoolVolume{Name: name, IpAddress: "10.0.0.2", MountName: "vol_123", State: VolumePoolVolumeStateHot},
+		},
+		{
+			name:         "volume is busy",
+			acls:         []VolumePoolNfsExportOptions{nodeACL},
+			responseCode: http.StatusBadRequest,
+			responseBody: apiErrorBody(http.StatusBadRequest, "FAILED_PRECONDITION", "another operation is in progress"),
+			wantBodyACLs: `[{"ipRanges":["10.128.0.11"],"accessMode":"READ_WRITE","squashMode":"NO_ROOT_SQUASH"}]`,
+			wantCode:     codes.FailedPrecondition,
+		},
+		{
+			name:         "volume does not exist",
+			acls:         []VolumePoolNfsExportOptions{nodeACL},
+			responseCode: http.StatusNotFound,
+			responseBody: apiErrorBody(http.StatusNotFound, "NOT_FOUND", "volume not found"),
+			wantBodyACLs: `[{"ipRanges":["10.128.0.11"],"accessMode":"READ_WRITE","squashMode":"NO_ROOT_SQUASH"}]`,
+			wantCode:     codes.NotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPatch || r.URL.Path != "/v1beta1/"+name {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				if got := r.URL.Query().Get("updateMask"); got != "ipAcls" {
+					t.Errorf("updateMask = %q, want ipAcls", got)
+				}
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("failed to decode request body: %v", err)
+				}
+				if got := string(body["ipAcls"]); got != tc.wantBodyACLs {
+					t.Errorf("request ipAcls = %s, want %s", got, tc.wantBodyACLs)
+				}
+				if got := string(body["name"]); got != fmt.Sprintf("%q", name) {
+					t.Errorf("request name = %s, want %q", got, name)
+				}
+				w.WriteHeader(tc.responseCode)
+				fmt.Fprint(w, tc.responseBody)
+			}))
+			defer server.Close()
+			manager := newVolumePoolTestManager(t, server)
+
+			got, err := manager.UpdateVolumePoolVolumeIpAcls(context.Background(), name, tc.acls)
+			if code := status.Code(VolumePoolStatusError(err)); code != tc.wantCode {
+				t.Fatalf("UpdateVolumePoolVolumeIpAcls() error = %v (code %v), want code %v", err, code, tc.wantCode)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("UpdateVolumePoolVolumeIpAcls() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGetVolumePoolVolume_IpAcls(t *testing.T) {
+	name := "projects/test-project/locations/us-central1/volumePools/test-pool/volumes/vol-123"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"name": %q, "state": "HOT", "mountPoint": {"ipAddress": "10.0.0.2", "mountName": "vol_123"},
+			"ipAcls": [{"ipRanges": ["10.128.0.11/32"], "accessMode": "READ_ONLY", "squashMode": "ROOT_SQUASH", "anonUid": "1000", "anonGid": "2000", "securityFlavors": ["AUTH_SYS"]}]}`, name)
+	}))
+	defer server.Close()
+	manager := newVolumePoolTestManager(t, server)
+
+	got, err := manager.GetVolumePoolVolume(context.Background(), name)
+	if err != nil {
+		t.Fatalf("GetVolumePoolVolume() error = %v", err)
+	}
+	want := []VolumePoolNfsExportOptions{{
+		IpRanges:        []string{"10.128.0.11/32"},
+		AccessMode:      VolumePoolAccessModeReadOnly,
+		SquashMode:      "ROOT_SQUASH",
+		AnonUid:         1000,
+		AnonGid:         2000,
+		SecurityFlavors: []string{"AUTH_SYS"},
+	}}
+	if diff := cmp.Diff(want, got.IpAcls); diff != "" {
+		t.Errorf("IpAcls mismatch (-want +got):\n%s", diff)
+	}
+}
