@@ -157,7 +157,9 @@ func main() {
 	}
 
 	var kubeClient *kubernetes.Clientset
-	if *featureMaxSharePerInstance && *runController && *enableMultishare {
+	// Publishing volume pool volumes looks up the IP addresses of Kubernetes
+	// Nodes, so the controller needs a client for them too.
+	if (*featureMaxSharePerInstance && *runController && *enableMultishare) || (*featureVolumePools && *runController) {
 		clusterConfig, err := util.BuildConfig(*kubeconfig)
 		if err != nil {
 			klog.Error(err.Error())
@@ -217,6 +219,11 @@ func main() {
 		FeatureVolumePools: &driver.FeatureVolumePools{
 			Enabled: *featureVolumePools,
 		},
+	}
+	// Set the client only when it exists: a nil *kubernetes.Clientset stored in
+	// the interface field would not compare equal to nil.
+	if *featureVolumePools && kubeClient != nil {
+		featureOptions.FeatureVolumePools.KubeClient = kubeClient
 	}
 
 	mounter := mount.New("")

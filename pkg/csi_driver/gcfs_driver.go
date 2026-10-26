@@ -109,6 +109,10 @@ type GCFSDriverFeatureOptions struct {
 
 type FeatureVolumePools struct {
 	Enabled bool
+	// KubeClient lets the controller look up Kubernetes Nodes, to find the IP
+	// address that volume pool volumes are published to. It is required when
+	// Enabled is set on a controller.
+	KubeClient kubernetes.Interface
 }
 
 type FeatureMultishareBackups struct {
@@ -206,6 +210,10 @@ func NewGCFSDriver(config *GCFSDriverConfig) (*GCFSDriver, error) {
 			driver.recon, driver.factory, driver.coreFactory, driver.driverFactory = initMultishareReconciler(config)
 		}
 		// Configure controller server
+		var nodes *volumePoolNodes
+		if vp := config.FeatureOptions.FeatureVolumePools; vp != nil && vp.Enabled && vp.KubeClient != nil {
+			nodes = newVolumePoolNodes(vp.KubeClient)
+		}
 		driver.cs = newControllerServer(&controllerServerConfig{
 			driver:            driver,
 			fileService:       config.Cloud.File,
@@ -220,6 +228,7 @@ func NewGCFSDriver(config *GCFSDriverConfig) (*GCFSDriver, error) {
 			features:          config.FeatureOptions,
 			extraVolumeLabels: config.ExtraVolumeLabels,
 			tagManager:        config.TagManager,
+			volumePoolNodes:   nodes,
 		})
 	}
 
