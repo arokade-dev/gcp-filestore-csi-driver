@@ -43,6 +43,9 @@ const (
 	// NFS lock release metrics.
 	kubeAPIDurationMetricName  = "kube_api_duration_seconds"
 	lockReleaseCountMetricName = "lock_release_count"
+	// volumePoolPublishEvictionCountMetricName counts volume pool volume
+	// publishes that removed another node's access to the volume.
+	volumePoolPublishEvictionCountMetricName = "volume_pool_publish_eviction_count"
 	// Label op_status_code indicates whether the k8s API operation succeeds or not.
 	labelOpStatusCode = "op_status_code"
 	successStatusCode = "success"
@@ -103,6 +106,14 @@ var (
 		},
 		[]string{labelOpStatusCode, labelResourceType, labelOpType, labelOpSource},
 	)
+
+	volumePoolPublishEvictionCount = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Subsystem: subSystem,
+			Name:      volumePoolPublishEvictionCountMetricName,
+			Help:      "Metric to expose count of volume pool volume publishes that removed another node's access to the volume.",
+		},
+	)
 )
 
 type MetricsManager struct {
@@ -131,6 +142,16 @@ func (mm *MetricsManager) RegisterLockReleaseCountnMetric() {
 
 func (mm *MetricsManager) RegisterKubeAPIDurationMetric() {
 	mm.registry.MustRegister(kubeAPIDurationMilliseconds)
+}
+
+func (mm *MetricsManager) RegisterVolumePoolPublishEvictionCountMetric() {
+	mm.registry.MustRegister(volumePoolPublishEvictionCount)
+}
+
+// RecordVolumePoolPublishEviction counts a volume pool volume publish that
+// removed another node's access to the volume.
+func (mm *MetricsManager) RecordVolumePoolPublishEviction() {
+	volumePoolPublishEvictionCount.Inc()
 }
 
 func (mm *MetricsManager) registerComponentVersionMetric() {

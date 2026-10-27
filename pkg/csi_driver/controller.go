@@ -171,6 +171,9 @@ type controllerServerConfig struct {
 	features             *GCFSDriverFeatureOptions
 	extraVolumeLabels    map[string]string
 	tagManager           cloud.TagService
+	// volumePoolNodes looks up the nodes that volume pool volumes are
+	// published to. It is nil when the Volume Pools feature is off.
+	volumePoolNodes *volumePoolNodes
 }
 
 func newControllerServer(config *controllerServerConfig) csi.ControllerServer {
@@ -196,6 +199,7 @@ func newControllerServer(config *controllerServerConfig) csi.ControllerServer {
 }
 
 func (m *controllerServer) Run(stopCh <-chan struct{}) {
+	m.startVolumePoolNodes(stopCh)
 	if m.config.multiShareController == nil {
 		return
 	}
