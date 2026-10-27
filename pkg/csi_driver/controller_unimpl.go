@@ -23,14 +23,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerPublishVolume unsupported")
-}
-
-func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerUnpublishVolume unsupported")
-}
-
 func (s *controllerServer) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	// https://cloud.google.com/compute/docs/reference/beta/disks/list
 	// List volumes in the whole region? In only the zone that this controller is running?

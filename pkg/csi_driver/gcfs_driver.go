@@ -204,6 +204,10 @@ func NewGCFSDriver(config *GCFSDriverConfig) (*GCFSDriver, error) {
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 			csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
 		}
+		// Volume pool volumes are published to nodes through their IP ACLs.
+		if vp := config.FeatureOptions.FeatureVolumePools; vp != nil && vp.Enabled {
+			csc = append(csc, csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME)
+		}
 		driver.addControllerServiceCapabilities(csc)
 
 		if config.FeatureOptions.FeatureStateful != nil && config.FeatureOptions.FeatureStateful.Enabled {

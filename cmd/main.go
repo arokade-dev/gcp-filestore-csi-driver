@@ -108,6 +108,9 @@ func main() {
 		if *httpEndpoint != "" && metrics.IsGKEComponentVersionAvailable() {
 			mm = metrics.NewMetricsManager()
 			mm.RegisterOperationSecondsMetric()
+			if *featureVolumePools {
+				mm.RegisterVolumePoolPublishEvictionCountMetric()
+			}
 			mm.InitializeHttpHandler(*httpEndpoint, *metricsPath)
 			mm.EmitGKEComponentVersion()
 		}
