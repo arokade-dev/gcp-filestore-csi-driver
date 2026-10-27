@@ -29,6 +29,8 @@ This overlay enables the **GCP Filestore CSI Driver** to integrate natively with
 
 4. **IAM Permissions Requirement**: The user or automation executing the deployment script *must* have the permissions to create Service Accounts and assign IAM bindings in the target GCP Project (e.g. `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin`, or broadly `roles/owner`).
 
+5. **Volume IP ACL Updates**: The driver publishes a volume to a node by updating the volume's IP ACLs (see [Publishing Volumes to Nodes](#-publishing-volumes-to-nodes)), so your GCP Project must also be allowlisted for volume IP ACL updates. Without it, publishing fails with `Aborted` and the message `Volume Freeze and Thaw APIs are not enabled`.
+
 This integration utilizes **GKE Workload Identity** to securely authenticate against Google Cloud Filestore APIs without storing static JSON credentials in Kubernetes secrets.
 
 > [!NOTE]
@@ -83,3 +85,15 @@ The included `deploy.sh` script completely automates the installation, validates
    ```
 
 *(Note: If you skip `deploy.sh`, you will need to manually render and apply `examples/kubernetes/substrate/storageclass.yaml.tmpl` to provision micro-volumes from a VolumePool).*
+
+---
+
+## 🔐 Publishing Volumes to Nodes
+
+With `--feature-volume-pools=true`, the controller advertises the `PUBLISH_UNPUBLISH_VOLUME` capability, and Substrate publishes a volume to the node that mounts it:
+
+- `ControllerPublishVolume` restricts the volume's IP ACLs to the node's internal IPv4 address. A new volume is exported to all private IP ranges until it is first published.
+- `ControllerUnpublishVolume` removes the node's address. A volume that is published to no node is exported to no client.
+- With a single-node access mode, such as `SINGLE_NODE_WRITER`, publishing replaces the address of another node, which a crashed node can leave behind. The controller then logs a warning and increments the `filestorecsi_volume_pool_publish_eviction_count` metric.
+- The controller finds a node's address through a Node informer, using the `get`, `list` and `watch` permissions on nodes that its ClusterRole already grants.
+- The CSIDriver object keeps `attachRequired: false`, so Kubernetes itself never calls these RPCs.
