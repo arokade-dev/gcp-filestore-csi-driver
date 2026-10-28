@@ -407,7 +407,7 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 				fs.getVolume = volumeInState(file.VolumePoolVolumeStateWarm)
 			},
 			req:      publishRequest("node-a", snw),
-			wantCode: codes.Aborted,
+			wantCode: codes.FailedPrecondition,
 		},
 		{
 			name: "volume busy with another operation",

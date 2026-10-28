@@ -241,12 +241,17 @@ func (s *controllerServer) volumePoolNodeIP(nodeID string) (string, error) {
 }
 
 // checkVolumePoolVolumePublishable returns nil if the IP ACLs of vol can be
-// changed, which the API allows only for HOT volumes.
+// changed, which the API allows only for HOT volumes. A COLD or WARM volume
+// gives FailedPrecondition, because it stays so until it is unfrozen or made
+// HOT. A volume that is still being created, or that has no mount point yet,
+// gives Aborted, so that the caller retries.
 func checkVolumePoolVolumePublishable(vol *file.PoolVolume) error {
-	if vol.State == file.VolumePoolVolumeStateCold {
+	switch {
+	case vol.State == file.VolumePoolVolumeStateCold:
 		return status.Errorf(codes.FailedPrecondition, "volume %q is COLD; unfreeze it before publishing it", vol.Name)
-	}
-	if !isVolumePoolVolumeHot(vol) {
+	case vol.State == file.VolumePoolVolumeStateWarm:
+		return status.Errorf(codes.FailedPrecondition, "volume %q is WARM, which cannot be mounted; make it HOT before publishing it", vol.Name)
+	case !isVolumePoolVolumeHot(vol):
 		return status.Errorf(codes.Aborted, "volume %q cannot be published yet: its state is %q", vol.Name, vol.State)
 	}
 	return nil
