@@ -319,6 +319,45 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			wantUpdates: 1,
 		},
 		{
+			name:        "republishing read-only to a node published read-write fails",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA)},
+			req: func() *csi.ControllerPublishVolumeRequest {
+				req := publishRequest("node-a", snw)
+				req.Readonly = true
+				return req
+			}(),
+			wantCode: codes.AlreadyExists,
+			wantAcls: []file.VolumePoolNfsExportOptions{rw(ipA)},
+		},
+		{
+			name:        "republishing read-write to a node published read-only fails",
+			initialAcls: []file.VolumePoolNfsExportOptions{ro(ipA)},
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.AlreadyExists,
+			wantAcls:    []file.VolumePoolNfsExportOptions{ro(ipA)},
+		},
+		{
+			name:        "republishing with another access mode to the node's /32 entry fails",
+			initialAcls: []file.VolumePoolNfsExportOptions{ro(ipA + "/32")},
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.AlreadyExists,
+			wantAcls:    []file.VolumePoolNfsExportOptions{ro(ipA + "/32")},
+		},
+		{
+			name:        "multi-node republishing with a reader-only mode fails",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA), rw(ipB)},
+			req:         publishRequest("node-a", csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY),
+			wantCode:    codes.AlreadyExists,
+			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA), rw(ipB)},
+		},
+		{
+			name:        "an entry without an access mode is read-write",
+			initialAcls: []file.VolumePoolNfsExportOptions{{IpRanges: []string{ipA}, SquashMode: file.VolumePoolSquashModeNoRoot}},
+			req:         publishRequest("node-a", snw),
+			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
+			wantUpdates: 1,
+		},
+		{
 			name:        "multi-node publish exports a new volume to the node only",
 			req:         publishRequest("node-a", mnmw),
 			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
@@ -340,7 +379,7 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 		},
 		{
 			name:        "multi-node publish keeps the node's place",
-			initialAcls: []file.VolumePoolNfsExportOptions{ro(ipA), rw(ipB)},
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA + "/32"), rw(ipB)},
 			req:         publishRequest("node-a", mnmw),
 			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA), rw(ipB)},
 			wantUpdates: 1,
@@ -753,9 +792,14 @@ func TestControllerCapabilities_PublishUnpublish(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			driver := initTestControllerDriver(t, tc.feature)
-			err := driver.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME)
-			if got := err == nil; got != tc.want {
-				t.Errorf("PUBLISH_UNPUBLISH_VOLUME advertised = %v, want %v", got, tc.want)
+			for _, c := range []csi.ControllerServiceCapability_RPC_Type{
+				csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+				csi.ControllerServiceCapability_RPC_PUBLISH_READONLY,
+			} {
+				err := driver.ValidateControllerServiceRequest(c)
+				if got := err == nil; got != tc.want {
+					t.Errorf("%v advertised = %v, want %v", c, got, tc.want)
+				}
 			}
 		})
 	}
@@ -774,7 +818,7 @@ func TestPublishedVolumePoolIpAcls_Evicted(t *testing.T) {
 		{name: "new volume", current: newVolumeIpAcls(), singleNode: true},
 		{name: "published to the node", current: []file.VolumePoolNfsExportOptions{rw(ipA)}, singleNode: true},
 		{name: "published to another node", current: []file.VolumePoolNfsExportOptions{rw(ipB)}, singleNode: true, wantEvicted: []string{ipB}},
-		{name: "published to another node, with wider ranges", current: append(newVolumeIpAcls(), ro(ipA, ipB+"/32")), singleNode: true, wantEvicted: []string{ipB + "/32"}},
+		{name: "published to another node, with wider ranges", current: append(newVolumeIpAcls(), rw(ipA, ipB+"/32")), singleNode: true, wantEvicted: []string{ipB + "/32"}},
 		{name: "multi-node", current: append(newVolumeIpAcls(), rw(ipB)), singleNode: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

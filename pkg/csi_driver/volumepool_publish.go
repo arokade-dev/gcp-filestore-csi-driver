@@ -298,6 +298,11 @@ func volumePoolNodeIpAcl(ip string, readOnly bool) file.VolumePoolNfsExportOptio
 // the rule for all private IP ranges that the API gives a new volume, are
 // removed, so that only the nodes can mount the volume.
 //
+// If the volume is already published to the node with another access mode, an
+// error with code AlreadyExists is returned, as the CSI spec requires for a
+// publish that is incompatible with an earlier one: changing the mode would
+// change the access of a node that may be using the volume.
+//
 // With a single-node access mode, the result is rule alone. That replaces the
 // entry of a node that the volume was never unpublished from, for example
 // because the node crashed. If the volume is published to two or more other
@@ -308,6 +313,9 @@ func volumePoolNodeIpAcl(ip string, readOnly bool) file.VolumePoolNfsExportOptio
 func publishedVolumePoolIpAcls(current []file.VolumePoolNfsExportOptions, rule file.VolumePoolNfsExportOptions, singleNode bool) ([]file.VolumePoolNfsExportOptions, []string, error) {
 	ip := rule.IpRanges[0]
 	nodes := volumePoolIpAclsOfNodes(current)
+	if mode, ok := volumePoolNodeAccessMode(nodes, ip); ok && mode != rule.AccessMode {
+		return nil, nil, status.Errorf(codes.AlreadyExists, "the volume is already published to %s as %s, and the request asks for %s", ip, mode, rule.AccessMode)
+	}
 	if singleNode {
 		others := volumePoolIpAclRanges(volumePoolIpAclsWithout(nodes, ip))
 		if len(others) > 1 {
@@ -321,6 +329,23 @@ func publishedVolumePoolIpAcls(current []file.VolumePoolNfsExportOptions, rule f
 		return nil, nil, status.Errorf(codes.ResourceExhausted, "the volume would be exported to %d IP ranges, but at most %d are allowed", n, maxVolumePoolIpAclRanges)
 	}
 	return acls, nil, nil
+}
+
+// volumePoolNodeAccessMode returns the access mode of the entry in acls for
+// the IP address ip, written either as an address or as a /32 range, and
+// whether there is one. An entry without an access mode is READ_WRITE, the
+// API's default.
+func volumePoolNodeAccessMode(acls []file.VolumePoolNfsExportOptions, ip string) (string, bool) {
+	for _, acl := range acls {
+		if len(withoutIPRange(acl.IpRanges, ip)) == len(acl.IpRanges) {
+			continue
+		}
+		if acl.AccessMode == "" {
+			return file.VolumePoolAccessModeReadWrite, true
+		}
+		return acl.AccessMode, true
+	}
+	return "", false
 }
 
 // volumePoolIpAclsOfNodes returns the entries of acls for nodes: acls with only
