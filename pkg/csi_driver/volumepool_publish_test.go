@@ -312,6 +312,20 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			wantAcls:    append(newVolumeIpAcls(), rw(ipB, ipC)),
 		},
 		{
+			name:        "single-node publish refuses a volume that the node shares with another",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA), rw(ipB)},
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.FailedPrecondition,
+			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA), rw(ipB)},
+		},
+		{
+			name:        "single-node publish refuses a volume that the node shares with another, in one entry",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA, ipB+"/32")},
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.FailedPrecondition,
+			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA, ipB+"/32")},
+		},
+		{
 			name:        "single-node publish rewrites the node's /32 entry",
 			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA + "/32")},
 			req:         publishRequest("node-a", snw),
@@ -818,7 +832,7 @@ func TestPublishedVolumePoolIpAcls_Evicted(t *testing.T) {
 		{name: "new volume", current: newVolumeIpAcls(), singleNode: true},
 		{name: "published to the node", current: []file.VolumePoolNfsExportOptions{rw(ipA)}, singleNode: true},
 		{name: "published to another node", current: []file.VolumePoolNfsExportOptions{rw(ipB)}, singleNode: true, wantEvicted: []string{ipB}},
-		{name: "published to another node, with wider ranges", current: append(newVolumeIpAcls(), rw(ipA, ipB+"/32")), singleNode: true, wantEvicted: []string{ipB + "/32"}},
+		{name: "published to another node, with wider ranges", current: append(newVolumeIpAcls(), rw(ipB+"/32")), singleNode: true, wantEvicted: []string{ipB + "/32"}},
 		{name: "multi-node", current: append(newVolumeIpAcls(), rw(ipB)), singleNode: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

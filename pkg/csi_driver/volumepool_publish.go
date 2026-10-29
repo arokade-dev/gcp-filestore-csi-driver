@@ -305,9 +305,11 @@ func volumePoolNodeIpAcl(ip string, readOnly bool) file.VolumePoolNfsExportOptio
 //
 // With a single-node access mode, the result is rule alone. That replaces the
 // entry of a node that the volume was never unpublished from, for example
-// because the node crashed. If the volume is published to two or more other
-// nodes, it looks shared and an error with code FailedPrecondition is returned
-// instead: replacing never removes more than one node.
+// because the node crashed. If the volume is published to two or more nodes,
+// counting the node of rule, it is shared, and an error with code
+// FailedPrecondition is returned instead. A single-node publish leaves a single
+// node, so two can only come from multi-node publishes: replacing never removes
+// a node that shares the volume with another.
 //
 // With a multi-node access mode, rule is added and the other nodes are kept.
 func publishedVolumePoolIpAcls(current []file.VolumePoolNfsExportOptions, rule file.VolumePoolNfsExportOptions, singleNode bool) ([]file.VolumePoolNfsExportOptions, []string, error) {
@@ -317,10 +319,10 @@ func publishedVolumePoolIpAcls(current []file.VolumePoolNfsExportOptions, rule f
 		return nil, nil, status.Errorf(codes.AlreadyExists, "the volume is already published to %s as %s, and the request asks for %s", ip, mode, rule.AccessMode)
 	}
 	if singleNode {
-		others := volumePoolIpAclRanges(volumePoolIpAclsWithout(nodes, ip))
-		if len(others) > 1 {
-			return nil, nil, status.Errorf(codes.FailedPrecondition, "the volume is published to %d other nodes (%s), and a volume published with a single-node access mode is exported to one node only", len(others), strings.Join(others, ", "))
+		if published := volumePoolIpAclRanges(nodes); len(published) > 1 {
+			return nil, nil, status.Errorf(codes.FailedPrecondition, "the volume is published to %d nodes (%s), and a volume published with a single-node access mode is exported to one node only", len(published), strings.Join(published, ", "))
 		}
+		others := volumePoolIpAclRanges(volumePoolIpAclsWithout(nodes, ip))
 		return []file.VolumePoolNfsExportOptions{rule}, others, nil
 	}
 
