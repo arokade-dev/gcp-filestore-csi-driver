@@ -525,7 +525,7 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 				cs.config.features.FeatureVolumePools.Enabled = false
 			},
 			req:      publishRequest("node-a", snw),
-			wantCode: codes.FailedPrecondition,
+			wantCode: codes.Unimplemented,
 		},
 		{
 			name: "malformed volume pool volume ID",
@@ -606,6 +606,41 @@ func TestControllerPublishVolume_NotVolumePool(t *testing.T) {
 	expectCode(t, err, codes.OK)
 	if len(fs.calls) != 0 {
 		t.Errorf("file service called %v, want no calls", fs.calls)
+	}
+}
+
+// Without the Volume Pools feature, the controller doesn't advertise
+// PUBLISH_UNPUBLISH_VOLUME: both calls return Unimplemented, whatever the
+// request, as they did before they were implemented.
+func TestControllerPublishUnpublish_FeatureOff(t *testing.T) {
+	ctx := context.Background()
+	featureOff := func(cs *controllerServer) { cs.config.features.FeatureVolumePools.Enabled = false }
+	for _, tc := range []struct {
+		name     string
+		setup    func(cs *controllerServer)
+		volumeID string
+	}{
+		{name: "volume pool volume", setup: featureOff, volumeID: testSourceVolumeID},
+		{name: "instance volume", setup: featureOff, volumeID: "modeInstance/us-central1-c/myinstance/myshare"},
+		{name: "no volume ID", setup: featureOff, volumeID: ""},
+		{name: "no feature options", setup: func(cs *controllerServer) { cs.config.features = nil }, volumeID: testSourceVolumeID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs, fs := newPublishTestController(t)
+			tc.setup(cs)
+
+			pubReq := publishRequest("node-a", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+			pubReq.VolumeId = tc.volumeID
+			_, err := cs.ControllerPublishVolume(ctx, pubReq)
+			expectCode(t, err, codes.Unimplemented)
+
+			_, err = cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: tc.volumeID, NodeId: "node-a"})
+			expectCode(t, err, codes.Unimplemented)
+
+			if len(fs.calls) != 0 {
+				t.Errorf("file service called %v, want no calls", fs.calls)
+			}
+		})
 	}
 }
 
@@ -748,7 +783,7 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 				cs.config.features.FeatureVolumePools.Enabled = false
 			},
 			nodeID:   "node-a",
-			wantCode: codes.FailedPrecondition,
+			wantCode: codes.Unimplemented,
 		},
 		{
 			name:     "malformed volume pool volume ID",

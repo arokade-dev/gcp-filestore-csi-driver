@@ -56,7 +56,14 @@ const (
 // ControllerPublishVolume lets the node req.NodeId mount the volume. Only volume
 // pool volumes restrict NFS access per node: publishing one puts the node's IP
 // address in the volume's IP ACLs. Other volumes need no publishing.
+//
+// Without the Volume Pools feature, the controller doesn't advertise
+// PUBLISH_UNPUBLISH_VOLUME, and the call returns Unimplemented, whatever the
+// request.
 func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	if !s.volumePoolsEnabled() {
+		return nil, status.Error(codes.Unimplemented, "ControllerPublishVolume is supported only with the Volume Pools feature")
+	}
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "ControllerPublishVolume volume ID must be provided")
@@ -69,9 +76,6 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 	if !isVolumePoolVolumeID(volumeID) {
 		return &csi.ControllerPublishVolumeResponse{}, nil
-	}
-	if !s.volumePoolsEnabled() {
-		return nil, status.Errorf(codes.FailedPrecondition, "cannot publish volume pool volume %q: Volume Pools feature is disabled", volumeID)
 	}
 
 	start := time.Now()
@@ -89,16 +93,19 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 // volume. For a volume pool volume, the node's IP address is removed from the
 // volume's IP ACLs, and an empty node ID removes every entry. Other volumes
 // need no unpublishing.
+//
+// Without the Volume Pools feature, the call returns Unimplemented, like
+// ControllerPublishVolume.
 func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	if !s.volumePoolsEnabled() {
+		return nil, status.Error(codes.Unimplemented, "ControllerUnpublishVolume is supported only with the Volume Pools feature")
+	}
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "ControllerUnpublishVolume volume ID must be provided")
 	}
 	if !isVolumePoolVolumeID(volumeID) {
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
-	}
-	if !s.volumePoolsEnabled() {
-		return nil, status.Errorf(codes.FailedPrecondition, "cannot unpublish volume pool volume %q: Volume Pools feature is disabled", volumeID)
 	}
 
 	start := time.Now()
