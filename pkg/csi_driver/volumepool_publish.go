@@ -204,6 +204,13 @@ func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *c
 		return nil
 	}
 	if err := s.updateVolumePoolIpAcls(ctx, name, acls); err != nil {
+		if status.Code(err) == codes.NotFound {
+			// The volume was deleted after it was read, for example by
+			// DeleteVolume, which takes another lock. No node can mount
+			// it anymore.
+			klog.Infof("Volume Pool volume %q was deleted, so it is no longer published to node %q", name, nodeID)
+			return nil
+		}
 		return err
 	}
 	klog.Infof("Unpublished Volume Pool volume %q from node %q", name, nodeID)

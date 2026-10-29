@@ -474,6 +474,17 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			wantUpdates: 1,
 		},
 		{
+			name: "volume deleted before its IP ACLs are updated",
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.updateIpAcls = func(context.Context, string, []file.VolumePoolNfsExportOptions) (*file.PoolVolume, error) {
+					return nil, status.Error(codes.NotFound, "volume not found")
+				}
+			},
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.NotFound,
+			wantUpdates: 1,
+		},
+		{
 			name: "another IP ACL change is in progress",
 			setup: func(cs *controllerServer, _ *publishTestService) {
 				cs.config.volumeLocks.TryAcquire(testSourceVolumeName + volumePoolIpAclsLockSuffix)
@@ -689,6 +700,20 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 			},
 			nodeID:      "node-a",
 			wantCode:    codes.Aborted,
+			wantUpdates: 1,
+		},
+		{
+			// The fake still has the volume: the PATCH simulates its
+			// deletion after the GET.
+			name:        "volume deleted before its IP ACLs are updated",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA)},
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.updateIpAcls = func(context.Context, string, []file.VolumePoolNfsExportOptions) (*file.PoolVolume, error) {
+					return nil, status.Error(codes.NotFound, "volume not found")
+				}
+			},
+			nodeID:      "node-a",
+			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
 			wantUpdates: 1,
 		},
 		{
