@@ -671,7 +671,7 @@ func defaultVolumePoolIpAcls() []VolumePoolNfsExportOptions {
 		IpRanges:        []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 		AccessMode:      VolumePoolAccessModeReadWrite,
 		SquashMode:      VolumePoolSquashModeNoRoot,
-		SecurityFlavors: []string{"AUTH_SYS"},
+		SecurityFlavors: []string{VolumePoolSecurityFlavorAuthSys},
 	}}
 }
 

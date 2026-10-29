@@ -1887,11 +1887,13 @@ type VolumePoolNfsExportOptions struct {
 	Network         string   `json:"network,omitempty"`
 }
 
-// Values of VolumePoolNfsExportOptions.AccessMode and SquashMode.
+// Values of VolumePoolNfsExportOptions.AccessMode, SquashMode and
+// SecurityFlavors.
 const (
-	VolumePoolAccessModeReadWrite = "READ_WRITE"
-	VolumePoolAccessModeReadOnly  = "READ_ONLY"
-	VolumePoolSquashModeNoRoot    = "NO_ROOT_SQUASH"
+	VolumePoolAccessModeReadWrite   = "READ_WRITE"
+	VolumePoolAccessModeReadOnly    = "READ_ONLY"
+	VolumePoolSquashModeNoRoot      = "NO_ROOT_SQUASH"
+	VolumePoolSecurityFlavorAuthSys = "AUTH_SYS"
 )
 
 // volumePoolIpAclsUpdate is the body of a request that replaces a volume's IP

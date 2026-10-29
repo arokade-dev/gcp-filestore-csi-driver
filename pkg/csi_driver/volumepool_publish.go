@@ -283,16 +283,19 @@ func (s *controllerServer) updateVolumePoolIpAcls(ctx context.Context, name stri
 }
 
 // volumePoolNodeIpAcl returns the IP ACL entry that lets the node with IP
-// address ip mount a volume.
+// address ip mount a volume. It lists AUTH_SYS, like the rule that the API
+// gives a new volume, rather than no security flavor: the API passes the list
+// to the share unchanged.
 func volumePoolNodeIpAcl(ip string, readOnly bool) file.VolumePoolNfsExportOptions {
 	accessMode := file.VolumePoolAccessModeReadWrite
 	if readOnly {
 		accessMode = file.VolumePoolAccessModeReadOnly
 	}
 	return file.VolumePoolNfsExportOptions{
-		IpRanges:   []string{ip},
-		AccessMode: accessMode,
-		SquashMode: file.VolumePoolSquashModeNoRoot,
+		IpRanges:        []string{ip},
+		AccessMode:      accessMode,
+		SquashMode:      file.VolumePoolSquashModeNoRoot,
+		SecurityFlavors: []string{file.VolumePoolSecurityFlavorAuthSys},
 	}
 }
 

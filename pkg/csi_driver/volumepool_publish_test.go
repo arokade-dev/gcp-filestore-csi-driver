@@ -191,8 +191,15 @@ func publishRequest(nodeID string, mode csi.VolumeCapability_AccessMode_Mode) *c
 	}
 }
 
+// acl returns the IP ACL entry that publishing gives the nodes with IP
+// addresses ipRanges.
 func acl(accessMode string, ipRanges ...string) file.VolumePoolNfsExportOptions {
-	return file.VolumePoolNfsExportOptions{IpRanges: ipRanges, AccessMode: accessMode, SquashMode: file.VolumePoolSquashModeNoRoot}
+	return file.VolumePoolNfsExportOptions{
+		IpRanges:        ipRanges,
+		AccessMode:      accessMode,
+		SquashMode:      file.VolumePoolSquashModeNoRoot,
+		SecurityFlavors: []string{file.VolumePoolSecurityFlavorAuthSys},
+	}
 }
 
 func rw(ipRanges ...string) file.VolumePoolNfsExportOptions {
@@ -210,7 +217,7 @@ func newVolumeIpAcls() []file.VolumePoolNfsExportOptions {
 		IpRanges:        []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 		AccessMode:      file.VolumePoolAccessModeReadWrite,
 		SquashMode:      file.VolumePoolSquashModeNoRoot,
-		SecurityFlavors: []string{"AUTH_SYS"},
+		SecurityFlavors: []string{file.VolumePoolSecurityFlavorAuthSys},
 	}}
 }
 
@@ -367,6 +374,17 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 		{
 			name:        "an entry without an access mode is read-write",
 			initialAcls: []file.VolumePoolNfsExportOptions{{IpRanges: []string{ipA}, SquashMode: file.VolumePoolSquashModeNoRoot}},
+			req:         publishRequest("node-a", snw),
+			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
+			wantUpdates: 1,
+		},
+		{
+			name: "an entry for the node without a security flavor gets AUTH_SYS",
+			initialAcls: []file.VolumePoolNfsExportOptions{{
+				IpRanges:   []string{ipA},
+				AccessMode: file.VolumePoolAccessModeReadWrite,
+				SquashMode: file.VolumePoolSquashModeNoRoot,
+			}},
 			req:         publishRequest("node-a", snw),
 			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
 			wantUpdates: 1,
