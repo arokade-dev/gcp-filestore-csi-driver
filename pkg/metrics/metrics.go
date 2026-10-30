@@ -44,7 +44,7 @@ const (
 	kubeAPIDurationMetricName  = "kube_api_duration_seconds"
 	lockReleaseCountMetricName = "lock_release_count"
 	// volumePoolPublishEvictionCountMetricName counts volume pool volume
-	// publishes that removed another node's access to the volume.
+	// publishes that replaced the entry of a node that no longer exists in the volume's IP ACLs.
 	volumePoolPublishEvictionCountMetricName = "volume_pool_publish_eviction_count"
 	// Label op_status_code indicates whether the k8s API operation succeeds or not.
 	labelOpStatusCode = "op_status_code"
@@ -111,7 +111,7 @@ var (
 		&metrics.CounterOpts{
 			Subsystem: subSystem,
 			Name:      volumePoolPublishEvictionCountMetricName,
-			Help:      "Metric to expose count of volume pool volume publishes that removed another node's access to the volume.",
+			Help:      "Metric to expose count of volume pool volume publishes that replaced the entry of a node that no longer exists in the volume's IP ACLs.",
 		},
 	)
 )
@@ -149,7 +149,7 @@ func (mm *MetricsManager) RegisterVolumePoolPublishEvictionCountMetric() {
 }
 
 // RecordVolumePoolPublishEviction counts a volume pool volume publish that
-// removed another node's access to the volume.
+// replaced the entry of a node that no longer exists in the volume's IP ACLs.
 func (mm *MetricsManager) RecordVolumePoolPublishEviction() {
 	volumePoolPublishEvictionCount.Inc()
 }

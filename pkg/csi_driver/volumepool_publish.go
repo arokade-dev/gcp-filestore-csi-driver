@@ -150,16 +150,33 @@ func (s *controllerServer) publishVolumePoolVolume(ctx context.Context, req *csi
 
 	mode := req.GetVolumeCapability().GetAccessMode().GetMode()
 	rule := volumePoolNodeIpAcl(nodeIP, req.GetReadonly() || isReadOnlyAccessMode(mode))
-	acls, evicted, err := publishedVolumePoolIpAcls(vol.IpAcls, rule, isSingleNodeAccessMode(mode))
+	acls, others, err := publishedVolumePoolIpAcls(vol.IpAcls, rule, isSingleNodeAccessMode(mode))
 	if err != nil {
 		return status.Errorf(status.Code(err), "cannot publish volume %q to node %q: %s", name, nodeID, status.Convert(err).Message())
+	}
+	// With a single-node access mode, the volume is published to one node at
+	// a time. If a node that exists has another entry's address, the volume
+	// is published to that node, and the CSI spec asks for
+	// FailedPrecondition: the caller must unpublish it there first. An
+	// address that no node has is stale, left by a node that is gone, and is
+	// replaced.
+	for _, r := range others {
+		ip := singleIPRangeAddress(r)
+		other, err := s.config.volumePoolNodes.ips.NodeWithIP(ip)
+		switch status.Code(err) {
+		case codes.OK:
+			return status.Errorf(codes.FailedPrecondition, "cannot publish volume %q to node %q: it is published to node %q (%s), and a volume with access mode %v can be published to one node at a time; unpublish it from that node first", name, nodeID, other, ip, mode)
+		case codes.NotFound:
+		default:
+			return err
+		}
 	}
 	if equalVolumePoolIpAcls(acls, vol.IpAcls) {
 		klog.V(4).Infof("Volume Pool volume %q is already published to node %q (%s)", name, nodeID, nodeIP)
 		return nil
 	}
-	if len(evicted) > 0 {
-		klog.Warningf("Publishing Volume Pool volume %q to node %q (%s) with access mode %v removes the access of %s: such a volume is exported to one node only", name, nodeID, nodeIP, mode, strings.Join(evicted, ", "))
+	if len(others) > 0 {
+		klog.Warningf("Publishing Volume Pool volume %q to node %q (%s) removes the entry for %s, which no node has: a node that is gone left it", name, nodeID, nodeIP, strings.Join(others, ", "))
 		s.config.metricsManager.RecordVolumePoolPublishEviction()
 	}
 	if err := s.updateVolumePoolIpAcls(ctx, name, acls); err != nil {
@@ -355,13 +372,13 @@ func volumePoolNodeIpAcl(ip string, readOnly bool) file.VolumePoolNfsExportOptio
 // publish that is incompatible with an earlier one: changing the mode would
 // change the access of a node that may be using the volume.
 //
-// With a single-node access mode, the result is rule alone. That replaces the
-// entry of a node that the volume was never unpublished from, for example
-// because the node crashed. If the volume is published to two or more nodes,
-// counting the node of rule, it is shared, and an error with code
+// With a single-node access mode, the result is rule alone, and the addresses
+// of the other nodes' entries, which it replaces, are returned: the caller
+// must refuse the publish if a node that exists has one of them, since the
+// volume is then published to that node. If the volume is published to two or
+// more nodes, counting the node of rule, it is shared, and an error with code
 // FailedPrecondition is returned instead. A single-node publish leaves a single
-// node, so two can only come from multi-node publishes: replacing never removes
-// a node that shares the volume with another.
+// node, so two can only come from multi-node publishes.
 //
 // With a multi-node access mode, rule is added and the other nodes are kept.
 func publishedVolumePoolIpAcls(current []file.VolumePoolNfsExportOptions, rule file.VolumePoolNfsExportOptions, singleNode bool) ([]file.VolumePoolNfsExportOptions, []string, error) {
@@ -434,6 +451,15 @@ func isSingleIPRange(r string) bool {
 	}
 	ones, bits := ipNet.Mask.Size()
 	return ones == bits
+}
+
+// singleIPRangeAddress returns the address of r, a single IPv4 address written
+// either as an address or as a /32 range.
+func singleIPRangeAddress(r string) string {
+	if ip, _, err := net.ParseCIDR(r); err == nil {
+		return ip.String()
+	}
+	return r
 }
 
 // volumePoolIpAclsWith returns acls with rule in place of any entry for rule's
@@ -630,6 +656,10 @@ type nodeIPResolver interface {
 	// NotFound if the node does not exist, FailedPrecondition if it has no
 	// internal IPv4 address, and Unavailable if nodes can't be looked up.
 	NodeIP(ctx context.Context, nodeName string) (string, error)
+	// NodeWithIP returns the name of the node whose internal IPv4 address is
+	// ip. The error has code NotFound if no node has it, and Unavailable if
+	// nodes can't be looked up yet.
+	NodeWithIP(ip string) (string, error)
 	// DeletedNodeIP returns the internal IPv4 address that the node had when
 	// it was last deleted, if that was recently and no node has the address
 	// now: GKE can give a deleted node's address to a new node. ok is false
@@ -702,20 +732,30 @@ func (r *informerNodeIPResolver) nodeDeleted(obj interface{}) {
 
 func (r *informerNodeIPResolver) DeletedNodeIP(nodeName string) (string, bool) {
 	v, ok := r.deleted.Get(nodeName)
-	if !ok || !r.synced() {
+	if !ok {
 		return "", false
 	}
 	ip := v.(string)
+	if _, err := r.NodeWithIP(ip); status.Code(err) != codes.NotFound {
+		return "", false
+	}
+	return ip, true
+}
+
+func (r *informerNodeIPResolver) NodeWithIP(ip string) (string, error) {
+	if !r.synced() {
+		return "", status.Error(codes.Unavailable, "the node cache is not synced yet")
+	}
 	nodes, err := r.lister.List(labels.Everything())
 	if err != nil {
-		return "", false
+		return "", status.Errorf(codes.Internal, "failed to list nodes from the node cache: %v", err)
 	}
 	for _, node := range nodes {
 		if nodeIP, err := nodeInternalIPv4(node); err == nil && nodeIP == ip {
-			return "", false
+			return node.Name, nil
 		}
 	}
-	return ip, true
+	return "", status.Errorf(codes.NotFound, "no node has address %s", ip)
 }
 
 // stripVolumePoolNode returns a copy of the Node obj with only what NodeIP

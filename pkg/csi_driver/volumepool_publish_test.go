@@ -73,6 +73,10 @@ func TestInformerNodeIPResolver(t *testing.T) {
 	if ip, err := nodes.ips.NodeIP(context.Background(), "node-a"); err != nil || ip != "10.128.0.11" {
 		t.Errorf("NodeIP() before the cache synced = %q, %v; want %q, nil", ip, err, "10.128.0.11")
 	}
+	// Nodes can be looked up by address only in the cache.
+	if _, err := nodes.ips.NodeWithIP("10.128.0.11"); status.Code(err) != codes.Unavailable {
+		t.Errorf("NodeWithIP() before the cache synced: error = %v, want code %v", err, codes.Unavailable)
+	}
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
@@ -105,6 +109,12 @@ func TestInformerNodeIPResolver(t *testing.T) {
 	// The cache follows changes to nodes: a node whose VM GKE recreates keeps
 	// its name, but can get another IP address.
 	ctx := context.Background()
+	if name, err := nodes.ips.NodeWithIP("10.128.0.11"); err != nil || name != "node-a" {
+		t.Errorf("NodeWithIP(10.128.0.11) = %q, %v; want node-a, nil", name, err)
+	}
+	if _, err := nodes.ips.NodeWithIP("10.128.0.250"); status.Code(err) != codes.NotFound {
+		t.Errorf("NodeWithIP(10.128.0.250) error = %v, want code %v", err, codes.NotFound)
+	}
 	nodeA, err := client.CoreV1().Nodes().Get(ctx, "node-a", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get node-a: %v", err)
@@ -549,6 +559,25 @@ func (f fakeNodeIPs) NodeIP(_ context.Context, nodeName string) (string, error) 
 
 func (fakeNodeIPs) DeletedNodeIP(string) (string, bool) { return "", false }
 
+func (f fakeNodeIPs) NodeWithIP(ip string) (string, error) {
+	for name, nodeIP := range f {
+		if nodeIP == ip {
+			return name, nil
+		}
+	}
+	return "", status.Errorf(codes.NotFound, "no node has address %s", ip)
+}
+
+// unsyncedNodeIPs is fakeNodeIPs before the node cache syncs: nodes can be
+// looked up by name, from the API server, but not by IP address.
+type unsyncedNodeIPs struct {
+	fakeNodeIPs
+}
+
+func (unsyncedNodeIPs) NodeWithIP(string) (string, error) {
+	return "", status.Error(codes.Unavailable, "the node cache is not synced yet")
+}
+
 // fakeNodeIPsWithDeleted adds nodes deleted recently, mapped to the IP
 // addresses they had, to fakeNodeIPs.
 type fakeNodeIPsWithDeleted struct {
@@ -570,6 +599,10 @@ func (unavailableNodeIPs) NodeIP(context.Context, string) (string, error) {
 }
 
 func (unavailableNodeIPs) DeletedNodeIP(string) (string, bool) { return "", false }
+
+func (unavailableNodeIPs) NodeWithIP(string) (string, error) {
+	return "", status.Error(codes.Unavailable, "the node cache is not synced yet")
+}
 
 // publishTestService wraps volumePoolTestService to count, and optionally
 // override, IP ACL updates.
@@ -746,18 +779,37 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			wantUpdates: 1,
 		},
 		{
-			name:        "single-node publish replaces another node",
+			// node-b exists, so the volume is published to it: the CSI spec
+			// asks for FAILED_PRECONDITION.
+			name:        "single-node publish refuses a volume published to another node",
 			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipB)},
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.FailedPrecondition,
+		},
+		{
+			name:        "single-node publish refuses a volume published to another node, with wider ranges",
+			initialAcls: append(newVolumeIpAcls(), rw(ipB+"/32")),
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.FailedPrecondition,
+		},
+		{
+			// No node has ipD: a node that is gone left the entry.
+			name:        "single-node publish replaces the entry of a node that is gone",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipD)},
 			req:         publishRequest("node-a", snw),
 			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
 			wantUpdates: 1,
 		},
 		{
-			name:        "single-node publish replaces another node and wider ranges",
-			initialAcls: append(newVolumeIpAcls(), rw(ipB+"/32")),
-			req:         publishRequest("node-a", snw),
-			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
-			wantUpdates: 1,
+			// Until the node cache syncs, it can't tell whether a node has
+			// the other entry's address.
+			name:        "single-node publish over another entry before the node cache syncs",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipD)},
+			setup: func(cs *controllerServer, _ *publishTestService) {
+				cs.config.volumePoolNodes = &volumePoolNodes{ips: unsyncedNodeIPs{fakeNodeIPs{"node-a": ipA}}}
+			},
+			req:      publishRequest("node-a", snw),
+			wantCode: codes.Unavailable,
 		},
 		{
 			name:        "single-node publish refuses a volume that looks shared",
@@ -1393,8 +1445,9 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 }
 
 // An actor's life in Substrate: resumes and suspends on different nodes, and a
-// crash that skips unpublishing. The volume starts with the IP ACLs that the
-// API gives a new volume.
+// crash, after which Substrate reverts the actor, which unpublishes its volume
+// from the node it ran on, before resuming it elsewhere. The volume starts
+// with the IP ACLs that the API gives a new volume.
 func TestControllerPublishUnpublish_ActorLifecycle(t *testing.T) {
 	ctx := context.Background()
 	cs, fs := newPublishTestController(t)
@@ -1402,27 +1455,36 @@ func TestControllerPublishUnpublish_ActorLifecycle(t *testing.T) {
 		t.Fatalf("IP ACLs of the new volume mismatch (-want +got):\n%s", diff)
 	}
 	snw := csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER
-	unpublish := func(nodeID string) *csi.ControllerUnpublishVolumeRequest {
-		return &csi.ControllerUnpublishVolumeRequest{VolumeId: testSourceVolumeID, NodeId: nodeID}
+	publish := func(nodeID string) func() error {
+		return func() error { _, err := cs.ControllerPublishVolume(ctx, publishRequest(nodeID, snw)); return err }
+	}
+	unpublish := func(nodeID string) func() error {
+		return func() error {
+			_, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: testSourceVolumeID, NodeId: nodeID})
+			return err
+		}
 	}
 
 	steps := []struct {
 		name        string
 		call        func() error
+		wantCode    codes.Code
 		wantAcls    []file.VolumePoolNfsExportOptions
 		wantUpdates int // total so far
 	}{
-		{"resume on node A", func() error { _, err := cs.ControllerPublishVolume(ctx, publishRequest("node-a", snw)); return err }, []file.VolumePoolNfsExportOptions{rw(ipA)}, 1},
-		{"resume workflow re-entered", func() error { _, err := cs.ControllerPublishVolume(ctx, publishRequest("node-a", snw)); return err }, []file.VolumePoolNfsExportOptions{rw(ipA)}, 1},
-		{"suspend on node A", func() error { _, err := cs.ControllerUnpublishVolume(ctx, unpublish("node-a")); return err }, nil, 2},
-		{"resume on node B", func() error { _, err := cs.ControllerPublishVolume(ctx, publishRequest("node-b", snw)); return err }, []file.VolumePoolNfsExportOptions{rw(ipB)}, 3},
-		{"crash on B, resume on node C", func() error { _, err := cs.ControllerPublishVolume(ctx, publishRequest("node-c", snw)); return err }, []file.VolumePoolNfsExportOptions{rw(ipC)}, 4},
-		{"late unpublish from node B", func() error { _, err := cs.ControllerUnpublishVolume(ctx, unpublish("node-b")); return err }, []file.VolumePoolNfsExportOptions{rw(ipC)}, 4},
-		{"delete on node C", func() error { _, err := cs.ControllerUnpublishVolume(ctx, unpublish("node-c")); return err }, nil, 5},
+		{name: "resume on node A", call: publish("node-a"), wantAcls: []file.VolumePoolNfsExportOptions{rw(ipA)}, wantUpdates: 1},
+		{name: "resume workflow re-entered", call: publish("node-a"), wantAcls: []file.VolumePoolNfsExportOptions{rw(ipA)}, wantUpdates: 1},
+		{name: "suspend on node A", call: unpublish("node-a"), wantAcls: nil, wantUpdates: 2},
+		{name: "resume on node B", call: publish("node-b"), wantAcls: []file.VolumePoolNfsExportOptions{rw(ipB)}, wantUpdates: 3},
+		{name: "crash on B, resume on node C before reverting", call: publish("node-c"), wantCode: codes.FailedPrecondition, wantAcls: []file.VolumePoolNfsExportOptions{rw(ipB)}, wantUpdates: 3},
+		{name: "revert unpublishes from node B", call: unpublish("node-b"), wantAcls: nil, wantUpdates: 4},
+		{name: "resume on node C", call: publish("node-c"), wantAcls: []file.VolumePoolNfsExportOptions{rw(ipC)}, wantUpdates: 5},
+		{name: "late unpublish from node B", call: unpublish("node-b"), wantAcls: []file.VolumePoolNfsExportOptions{rw(ipC)}, wantUpdates: 5},
+		{name: "delete on node C", call: unpublish("node-c"), wantAcls: nil, wantUpdates: 6},
 	}
 	for _, step := range steps {
-		if err := step.call(); err != nil {
-			t.Fatalf("%s: unexpected error: %v", step.name, err)
+		if code := status.Code(step.call()); code != step.wantCode {
+			t.Fatalf("%s: got code %v, want %v", step.name, code, step.wantCode)
 		}
 		if diff := cmp.Diff(step.wantAcls, testVolumeIpAcls(t, fs)); diff != "" {
 			t.Errorf("%s: IP ACLs mismatch (-want +got):\n%s", step.name, diff)
@@ -1485,14 +1547,14 @@ func TestPublishedVolumePoolIpAcls_Evicted(t *testing.T) {
 	}
 }
 
-// A single-node publish that replaces another node's entry counts an eviction
-// in filestorecsi_volume_pool_publish_eviction_count. Replacing the rule of a
-// new volume, or publishing again, doesn't.
+// A single-node publish that replaces the entry of a node that is gone counts
+// an eviction in filestorecsi_volume_pool_publish_eviction_count. Publishing
+// again, or refusing a volume published to another node, doesn't.
 func TestControllerPublishVolume_CountsEvictions(t *testing.T) {
 	ctx := context.Background()
 	mm := metrics.NewMetricsManager()
 	mm.RegisterVolumePoolPublishEvictionCountMetric()
-	cs, _ := newPublishTestController(t)
+	cs, fs := newPublishTestController(t)
 	cs.config.metricsManager = mm
 	// The counter is global, so other tests may have counted evictions too.
 	evictions := func() float64 {
@@ -1511,17 +1573,21 @@ func TestControllerPublishVolume_CountsEvictions(t *testing.T) {
 	}
 	start := evictions()
 
+	// The volume has the entry of a node that is gone.
+	setTestVolumeIpAcls(t, fs, []file.VolumePoolNfsExportOptions{rw(ipD)})
 	for _, step := range []struct {
-		node string
+		node     string
+		wantCode codes.Code
 		// want is the number of evictions counted since the start.
 		want float64
 	}{
-		{node: "node-a", want: 0}, // replaces the rule of a new volume
-		{node: "node-a", want: 0}, // publishes again
-		{node: "node-b", want: 1}, // replaces node-a
+		{node: "node-a", want: 1},                                     // replaces the stale entry
+		{node: "node-a", want: 1},                                     // publishes again
+		{node: "node-b", wantCode: codes.FailedPrecondition, want: 1}, // published to node-a
 	} {
-		if _, err := cs.ControllerPublishVolume(ctx, publishRequest(step.node, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
-			t.Fatalf("ControllerPublishVolume(%s) error = %v", step.node, err)
+		_, err := cs.ControllerPublishVolume(ctx, publishRequest(step.node, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER))
+		if code := status.Code(err); code != step.wantCode {
+			t.Fatalf("ControllerPublishVolume(%s) error = %v, want code %v", step.node, err, step.wantCode)
 		}
 		if got := evictions() - start; got != step.want {
 			t.Errorf("after publishing to %s: %v evictions counted, want %v", step.node, got, step.want)
