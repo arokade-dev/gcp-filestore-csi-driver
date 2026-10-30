@@ -19,6 +19,7 @@ package driver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -33,8 +34,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	cloud "sigs.k8s.io/gcp-filestore-csi-driver/pkg/cloud_provider"
@@ -60,8 +65,9 @@ func TestInformerNodeIPResolver(t *testing.T) {
 	)
 	nodes := newVolumePoolNodes(client)
 
-	if _, err := nodes.ips.NodeIP("node-a"); status.Code(err) != codes.Unavailable {
-		t.Errorf("NodeIP() before the cache synced: error = %v, want code %v", err, codes.Unavailable)
+	// Before the cache syncs, the node comes from the API server.
+	if ip, err := nodes.ips.NodeIP(context.Background(), "node-a"); err != nil || ip != "10.128.0.11" {
+		t.Errorf("NodeIP() before the cache synced = %q, %v; want %q, nil", ip, err, "10.128.0.11")
 	}
 
 	stopCh := make(chan struct{})
@@ -82,12 +88,72 @@ func TestInformerNodeIPResolver(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.node, func(t *testing.T) {
-			ip, err := nodes.ips.NodeIP(tc.node)
+			ip, err := nodes.ips.NodeIP(context.Background(), tc.node)
 			if code := status.Code(err); code != tc.wantCode {
 				t.Fatalf("NodeIP(%q) error = %v (code %v), want code %v", tc.node, err, code, tc.wantCode)
 			}
 			if ip != tc.wantIP {
 				t.Errorf("NodeIP(%q) = %q, want %q", tc.node, ip, tc.wantIP)
+			}
+		})
+	}
+}
+
+func TestInformerNodeIPResolver_CacheCantAnswer(t *testing.T) {
+	// The cache has node-a. The API server has node-a and node-b, which it
+	// added after the cache last heard from it.
+	nodeA := testNode("node-a", v1.NodeAddress{Type: v1.NodeInternalIP, Address: ipA})
+	nodeB := testNode("node-b", v1.NodeAddress{Type: v1.NodeInternalIP, Address: ipB})
+	forbidden := apierrors.NewForbidden(v1.Resource("nodes"), "node-b", errors.New("the service account may not get nodes"))
+	for _, tc := range []struct {
+		name   string
+		synced bool
+		node   string
+		// getErr is the error that the API server returns for GETs.
+		getErr   error
+		wantIP   string
+		wantCode codes.Code
+		wantMsg  string
+		wantGets int
+	}{
+		{name: "in the cache", synced: true, node: "node-a", wantIP: ipA},
+		{name: "not in the cache yet", synced: true, node: "node-b", wantIP: ipB, wantGets: 1},
+		{name: "cache not synced", node: "node-a", wantIP: ipA, wantGets: 1},
+		{name: "deleted", synced: true, node: "node-c", wantCode: codes.NotFound, wantGets: 1},
+		{name: "API server refuses", synced: true, node: "node-b", getErr: forbidden, wantCode: codes.Unavailable, wantMsg: "may not get nodes", wantGets: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			if err := indexer.Add(nodeA); err != nil {
+				t.Fatalf("failed to cache node-a: %v", err)
+			}
+			client := fake.NewSimpleClientset(nodeA, nodeB)
+			gets := 0
+			client.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+				gets++
+				if tc.getErr != nil {
+					return true, nil, tc.getErr
+				}
+				return false, nil, nil
+			})
+			r := &informerNodeIPResolver{
+				lister: corelisters.NewNodeLister(indexer),
+				synced: func() bool { return tc.synced },
+				client: client,
+			}
+
+			ip, err := r.NodeIP(context.Background(), tc.node)
+			if code := status.Code(err); code != tc.wantCode {
+				t.Fatalf("NodeIP(%q) error = %v (code %v), want code %v", tc.node, err, code, tc.wantCode)
+			}
+			if msg := status.Convert(err).Message(); !strings.Contains(msg, tc.wantMsg) {
+				t.Errorf("NodeIP(%q) error message = %q, want it to contain %q", tc.node, msg, tc.wantMsg)
+			}
+			if ip != tc.wantIP {
+				t.Errorf("NodeIP(%q) = %q, want %q", tc.node, ip, tc.wantIP)
+			}
+			if gets != tc.wantGets {
+				t.Errorf("NodeIP(%q) got the node from the API server %d times, want %d", tc.node, gets, tc.wantGets)
 			}
 		})
 	}
@@ -348,7 +414,7 @@ func initTestControllerDriver(t *testing.T, volumePools *FeatureVolumePools) *GC
 // internal IPv4 address.
 type fakeNodeIPs map[string]string
 
-func (f fakeNodeIPs) NodeIP(nodeName string) (string, error) {
+func (f fakeNodeIPs) NodeIP(_ context.Context, nodeName string) (string, error) {
 	ip, ok := f[nodeName]
 	if !ok {
 		return "", status.Errorf(codes.NotFound, "node %q not found", nodeName)

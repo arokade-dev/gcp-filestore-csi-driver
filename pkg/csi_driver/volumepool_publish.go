@@ -132,7 +132,7 @@ func (s *controllerServer) publishVolumePoolVolume(ctx context.Context, req *csi
 	}
 	defer unlock()
 
-	nodeIP, err := s.volumePoolNodeIP(nodeID)
+	nodeIP, err := s.volumePoolNodeIP(ctx, nodeID)
 	if err != nil {
 		return err
 	}
@@ -197,7 +197,7 @@ func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *c
 	// An empty node ID unpublishes the volume from every node.
 	var acls []file.VolumePoolNfsExportOptions
 	if nodeID != "" {
-		nodeIP, err := s.volumePoolNodeIP(nodeID)
+		nodeIP, err := s.volumePoolNodeIP(ctx, nodeID)
 		if err != nil {
 			if code := status.Code(err); code == codes.NotFound || code == codes.FailedPrecondition {
 				klog.Warningf("Leaving the IP ACLs of Volume Pool volume %q unchanged, because the IP address of node %q is unknown: %v. Publishing the volume to another node with a single-node access mode removes the node's entry.", name, nodeID, err)
@@ -247,12 +247,12 @@ func (s *controllerServer) lockVolumePoolIpAcls(name string) (func(), error) {
 
 // volumePoolNodeIP returns the IP address that node nodeID mounts volume pool
 // volumes from.
-func (s *controllerServer) volumePoolNodeIP(nodeID string) (string, error) {
+func (s *controllerServer) volumePoolNodeIP(ctx context.Context, nodeID string) (string, error) {
 	n := s.config.volumePoolNodes
 	if n == nil || n.ips == nil {
 		return "", status.Error(codes.Internal, "the controller has no Kubernetes client to look up nodes")
 	}
-	return n.ips.NodeIP(nodeID)
+	return n.ips.NodeIP(ctx, nodeID)
 }
 
 // checkVolumePoolVolumePublishable returns nil if the IP ACLs of vol can be
@@ -502,12 +502,13 @@ type volumePoolNodes struct {
 }
 
 // newVolumePoolNodes returns a volumePoolNodes that looks nodes up through a
-// Node informer on kubeClient. The informer starts with the controller.
+// Node informer on kubeClient, and through kubeClient itself when the
+// informer's cache can't answer. The informer starts with the controller.
 func newVolumePoolNodes(kubeClient kubernetes.Interface) *volumePoolNodes {
 	factory := informers.NewSharedInformerFactory(kubeClient, 0)
 	return &volumePoolNodes{
 		informers: factory,
-		ips:       newInformerNodeIPResolver(factory),
+		ips:       newInformerNodeIPResolver(factory, kubeClient),
 	}
 }
 
@@ -536,8 +537,8 @@ const (
 // waitForVolumePoolNodeCache waits until synced reports that the node cache
 // has synced, or until stopCh is closed, and reports whether the cache synced.
 // It logs when the cache syncs, and warns if it hasn't after warnAfter: if the
-// controller can't list nodes, the only other trace is client-go's errors
-// about *v1.Node.
+// controller can't list nodes, the only other trace in its logs is client-go's
+// errors about *v1.Node.
 func waitForVolumePoolNodeCache(stopCh <-chan struct{}, synced cache.InformerSynced, warnAfter time.Duration) bool {
 	start := time.Now()
 	warn := time.NewTimer(warnAfter)
@@ -549,7 +550,7 @@ func waitForVolumePoolNodeCache(stopCh <-chan struct{}, synced cache.InformerSyn
 		case <-stopCh:
 			return false
 		case <-warn.C:
-			klog.Warningf("The node cache for publishing Volume Pool volumes has not synced after %v. Until it does, ControllerPublishVolume and ControllerUnpublishVolume of Volume Pool volumes return Unavailable. Check that the controller's service account can list and watch nodes, and look for errors about *v1.Node in these logs.", warnAfter)
+			klog.Warningf("The node cache for publishing Volume Pool volumes has not synced after %v. Until it does, ControllerPublishVolume and ControllerUnpublishVolume of Volume Pool volumes get each node from the API server. Check that the controller's service account can list and watch nodes, and look for errors about *v1.Node in these logs.", warnAfter)
 		case <-poll.C:
 		}
 	}
@@ -562,21 +563,24 @@ func waitForVolumePoolNodeCache(stopCh <-chan struct{}, synced cache.InformerSyn
 type nodeIPResolver interface {
 	// NodeIP returns the node's internal IPv4 address. The error has code
 	// NotFound if the node does not exist, FailedPrecondition if it has no
-	// internal IPv4 address, and Unavailable if nodes can't be looked up yet.
-	NodeIP(nodeName string) (string, error)
+	// internal IPv4 address, and Unavailable if nodes can't be looked up.
+	NodeIP(ctx context.Context, nodeName string) (string, error)
 }
 
 // informerNodeIPResolver looks nodes up in a Node informer's cache, so that a
-// lookup makes no API call.
+// lookup usually makes no API call. When the cache can't answer, because it
+// hasn't synced yet or doesn't have the node yet, it gets the node from the API
+// server.
 type informerNodeIPResolver struct {
 	lister corelisters.NodeLister
 	synced cache.InformerSynced
+	client kubernetes.Interface
 }
 
 // newInformerNodeIPResolver returns a resolver backed by factory's Node
-// informer. It answers once the factory has started and the cache has synced.
-// The cache keeps only what NodeIP reads; see stripVolumePoolNode.
-func newInformerNodeIPResolver(factory informers.SharedInformerFactory) *informerNodeIPResolver {
+// informer, and by client when the informer's cache can't answer. The cache
+// keeps only what NodeIP reads; see stripVolumePoolNode.
+func newInformerNodeIPResolver(factory informers.SharedInformerFactory, client kubernetes.Interface) *informerNodeIPResolver {
 	nodes := factory.Core().V1().Nodes()
 	informer := nodes.Informer()
 	if err := informer.SetTransform(stripVolumePoolNode); err != nil {
@@ -587,6 +591,7 @@ func newInformerNodeIPResolver(factory informers.SharedInformerFactory) *informe
 	return &informerNodeIPResolver{
 		lister: nodes.Lister(),
 		synced: informer.HasSynced,
+		client: client,
 	}
 }
 
@@ -612,17 +617,27 @@ func stripVolumePoolNode(obj interface{}) (interface{}, error) {
 	}, nil
 }
 
-func (r *informerNodeIPResolver) NodeIP(nodeName string) (string, error) {
-	if !r.synced() {
-		return "", status.Error(codes.Unavailable, "the node cache is not synced yet")
+func (r *informerNodeIPResolver) NodeIP(ctx context.Context, nodeName string) (string, error) {
+	if r.synced() {
+		node, err := r.lister.Get(nodeName)
+		if err == nil {
+			return nodeInternalIPv4(node)
+		}
+		if !apierrors.IsNotFound(err) {
+			return "", status.Errorf(codes.Internal, "failed to get node %q from the node cache: %v", nodeName, err)
+		}
 	}
-	node, err := r.lister.Get(nodeName)
+	// The cache hasn't synced yet, or doesn't have the node: it was added
+	// after the cache last heard from the API server, or it doesn't exist.
+	// A GET without a resource version reads the node's latest state.
+	node, err := r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return "", status.Errorf(codes.NotFound, "node %q not found", nodeName)
 	}
 	if err != nil {
-		return "", status.Errorf(codes.Internal, "failed to get node %q: %v", nodeName, err)
+		return "", status.Errorf(codes.Unavailable, "failed to get node %q: %v", nodeName, err)
 	}
+	klog.V(4).Infof("Got node %q from the API server: the node cache hasn't synced or doesn't have it yet", nodeName)
 	return nodeInternalIPv4(node)
 }
 

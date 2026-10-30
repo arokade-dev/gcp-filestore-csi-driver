@@ -95,5 +95,5 @@ With `--feature-volume-pools=true`, the controller advertises the `PUBLISH_UNPUB
 - `ControllerPublishVolume` restricts the volume's IP ACLs to the node's internal IPv4 address. A new volume is exported to all private IP ranges until it is first published.
 - `ControllerUnpublishVolume` removes the node's address. A volume that is published to no node is exported to no client.
 - With a single-node access mode, such as `SINGLE_NODE_WRITER`, publishing replaces the address of another node, which a crashed node can leave behind. The controller then logs a warning and increments the `filestorecsi_volume_pool_publish_eviction_count` metric.
-- The controller finds a node's address through a Node informer, using the `get`, `list` and `watch` permissions on nodes that its ClusterRole already grants.
+- The controller finds a node's address in the cache of a Node informer, and gets the node from the API server when the cache can't answer: before it has synced, or for a node added since. It uses the `get`, `list` and `watch` permissions on nodes that its ClusterRole already grants.
 - The CSIDriver object keeps `attachRequired: false`, so Kubernetes itself never calls these RPCs.
