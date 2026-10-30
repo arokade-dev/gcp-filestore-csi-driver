@@ -19,15 +19,18 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 	cloud "sigs.k8s.io/gcp-filestore-csi-driver/pkg/cloud_provider"
 	"sigs.k8s.io/gcp-filestore-csi-driver/pkg/cloud_provider/file"
 )
@@ -81,6 +84,84 @@ func TestInformerNodeIPResolver(t *testing.T) {
 				t.Errorf("NodeIP(%q) = %q, want %q", tc.node, ip, tc.wantIP)
 			}
 		})
+	}
+}
+
+func TestNewVolumePoolNodes_CachesOnlyAddresses(t *testing.T) {
+	node := testNode("node-a", v1.NodeAddress{Type: v1.NodeInternalIP, Address: ipA})
+	node.Labels = map[string]string{"cloud.google.com/gke-nodepool": "default-pool"}
+	node.Status.Conditions = []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}
+	node.Status.Images = []v1.ContainerImage{{Names: []string{"registry.example/agent:1"}, SizeBytes: 1 << 20}}
+	nodes := newVolumePoolNodes(fake.NewSimpleClientset(node))
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	nodes.informers.Start(stopCh)
+	nodes.informers.WaitForCacheSync(stopCh)
+
+	cached, err := nodes.informers.Core().V1().Nodes().Lister().Get("node-a")
+	if err != nil {
+		t.Fatalf("node-a is not in the node cache: %v", err)
+	}
+	want := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Status:     v1.NodeStatus{Addresses: node.Status.Addresses},
+	}
+	// The fake API server may or may not set resource versions.
+	if diff := cmp.Diff(want, cached, cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion")); diff != "" {
+		t.Errorf("cached node-a diff (-want +got):\n%s", diff)
+	}
+}
+
+func TestStripVolumePoolNode(t *testing.T) {
+	addresses := []v1.NodeAddress{
+		{Type: v1.NodeInternalIP, Address: ipA},
+		{Type: v1.NodeHostName, Address: "node-a"},
+	}
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "node-a",
+			ResourceVersion: "42",
+			UID:             "0b5d6a3e",
+			Labels:          map[string]string{"cloud.google.com/gke-nodepool": "default-pool"},
+			Annotations:     map[string]string{"node.alpha.kubernetes.io/ttl": "0"},
+			ManagedFields:   []metav1.ManagedFieldsEntry{{Manager: "kubelet"}},
+		},
+		Spec: v1.NodeSpec{PodCIDR: "10.4.0.0/24"},
+		Status: v1.NodeStatus{
+			Addresses:  slices.Clone(addresses),
+			Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}},
+			Images:     []v1.ContainerImage{{Names: []string{"registry.example/agent:1"}, SizeBytes: 1 << 20}},
+		},
+	}
+	want := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a", ResourceVersion: "42"},
+		Status:     v1.NodeStatus{Addresses: addresses},
+	}
+
+	got, err := stripVolumePoolNode(node)
+	if err != nil {
+		t.Fatalf("stripVolumePoolNode() error = %v", err)
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("stripVolumePoolNode() diff (-want +got):\n%s", diff)
+	}
+	// The copy doesn't share its addresses with the original.
+	if stripped, ok := got.(*v1.Node); ok && len(stripped.Status.Addresses) > 0 {
+		stripped.Status.Addresses[0].Address = ipB
+		if node.Status.Addresses[0].Address != ipA {
+			t.Errorf("changing the stripped Node changed the original's addresses")
+		}
+	}
+
+	// A tombstone holds the node as cached, which is already stripped.
+	tombstone := cache.DeletedFinalStateUnknown{Key: "node-b", Obj: testNode("node-b")}
+	got, err = stripVolumePoolNode(tombstone)
+	if err != nil {
+		t.Fatalf("stripVolumePoolNode(tombstone) error = %v", err)
+	}
+	if diff := cmp.Diff(tombstone, got); diff != "" {
+		t.Errorf("stripVolumePoolNode(tombstone) diff (-want +got):\n%s", diff)
 	}
 }
 

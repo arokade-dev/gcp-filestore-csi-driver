@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -536,12 +537,41 @@ type informerNodeIPResolver struct {
 
 // newInformerNodeIPResolver returns a resolver backed by factory's Node
 // informer. It answers once the factory has started and the cache has synced.
+// The cache keeps only what NodeIP reads; see stripVolumePoolNode.
 func newInformerNodeIPResolver(factory informers.SharedInformerFactory) *informerNodeIPResolver {
 	nodes := factory.Core().V1().Nodes()
+	informer := nodes.Informer()
+	if err := informer.SetTransform(stripVolumePoolNode); err != nil {
+		// SetTransform fails only if the informer has already started, and
+		// the factory starts later, with the controller.
+		klog.Warningf("The node cache for publishing Volume Pool volumes keeps whole Node objects: %v", err)
+	}
 	return &informerNodeIPResolver{
 		lister: nodes.Lister(),
-		synced: nodes.Informer().HasSynced,
+		synced: informer.HasSynced,
 	}
+}
+
+// stripVolumePoolNode returns a copy of the Node obj with only what NodeIP
+// needs: its name, resource version and addresses. A whole Node also holds its
+// conditions, images, labels and annotations, many kilobytes in all, and every
+// controller replica caches every node. Anything else is returned unchanged,
+// such as the tombstone of a node deleted while the informer was disconnected,
+// which holds the node as cached.
+func stripVolumePoolNode(obj interface{}) (interface{}, error) {
+	node, ok := obj.(*v1.Node)
+	if !ok {
+		return obj, nil
+	}
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            node.Name,
+			ResourceVersion: node.ResourceVersion,
+		},
+		Status: v1.NodeStatus{
+			Addresses: slices.Clone(node.Status.Addresses),
+		},
+	}, nil
 }
 
 func (r *informerNodeIPResolver) NodeIP(nodeName string) (string, error) {
