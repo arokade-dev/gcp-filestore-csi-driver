@@ -30,6 +30,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	utilcache "k8s.io/apimachinery/pkg/util/cache"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -92,8 +94,10 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 
 // ControllerUnpublishVolume takes away the node req.NodeId's access to the
 // volume. For a volume pool volume, the node's IP address is removed from the
-// volume's IP ACLs, and an empty node ID removes every entry. Other volumes
-// need no unpublishing.
+// volume's IP ACLs, and so is the address that the node had when it was last
+// deleted, if that was recently: the node may be gone, or GKE may have created
+// it again with another address. An empty node ID removes every entry. Other
+// volumes need no unpublishing.
 //
 // Without the Volume Pools feature, the call returns Unimplemented, like
 // ControllerPublishVolume.
@@ -165,8 +169,9 @@ func (s *controllerServer) publishVolumePoolVolume(ctx context.Context, req *csi
 	return nil
 }
 
-// unpublishVolumePoolVolume removes the IP address of node req.NodeId from the
-// IP ACLs of the volume pool volume req.VolumeId.
+// unpublishVolumePoolVolume removes the IP addresses of node req.NodeId, its
+// current one and the one it had when it was last deleted, from the IP ACLs of
+// the volume pool volume req.VolumeId.
 func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) error {
 	volumeID, nodeID := req.GetVolumeId(), req.GetNodeId()
 	name, err := volumePoolVolumeName(volumeID)
@@ -199,16 +204,29 @@ func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *c
 	var acls []file.VolumePoolNfsExportOptions
 	nodes := "every node"
 	if nodeID != "" {
+		var ips []string
 		nodeIP, err := s.volumePoolNodeIP(ctx, nodeID)
-		if err != nil {
-			if code := status.Code(err); code == codes.NotFound || code == codes.FailedPrecondition {
-				klog.Warningf("Leaving the IP ACLs of Volume Pool volume %q unchanged, because the IP address of node %q is unknown: %v. Publishing the volume to another node with a single-node access mode removes the node's entry.", name, nodeID, err)
-				return nil
-			}
+		switch code := status.Code(err); {
+		case err == nil:
+			ips = append(ips, nodeIP)
+		case code != codes.NotFound && code != codes.FailedPrecondition:
 			return err
 		}
-		acls = volumePoolIpAclsWithout(vol.IpAcls, nodeIP)
-		nodes = fmt.Sprintf("node %q (%s)", nodeID, nodeIP)
+		// A node that is gone, or that GKE deleted and created again with
+		// another address, as when it repairs the node, can have left its
+		// old address in the IP ACLs.
+		if deletedIP, ok := s.config.volumePoolNodes.ips.DeletedNodeIP(nodeID); ok && deletedIP != nodeIP {
+			ips = append(ips, deletedIP)
+		}
+		if len(ips) == 0 {
+			klog.Warningf("Leaving the IP ACLs of Volume Pool volume %q unchanged, because the IP address of node %q is unknown: %v. Publishing the volume to another node with a single-node access mode removes the node's entry.", name, nodeID, err)
+			return nil
+		}
+		acls = vol.IpAcls
+		for _, ip := range ips {
+			acls = volumePoolIpAclsWithout(acls, ip)
+		}
+		nodes = fmt.Sprintf("node %q (%s)", nodeID, strings.Join(ips, ", "))
 	}
 	if equalVolumePoolIpAcls(acls, vol.IpAcls) {
 		klog.V(4).Infof("Volume Pool volume %q is not published to node %q", name, nodeID)
@@ -599,16 +617,35 @@ type nodeIPResolver interface {
 	// NotFound if the node does not exist, FailedPrecondition if it has no
 	// internal IPv4 address, and Unavailable if nodes can't be looked up.
 	NodeIP(ctx context.Context, nodeName string) (string, error)
+	// DeletedNodeIP returns the internal IPv4 address that the node had when
+	// it was last deleted, if that was recently and no node has the address
+	// now: GKE can give a deleted node's address to a new node. ok is false
+	// otherwise.
+	DeletedNodeIP(nodeName string) (ip string, ok bool)
 }
+
+const (
+	// maxDeletedVolumePoolNodes is how many deleted nodes the controller
+	// remembers the address of, at most.
+	maxDeletedVolumePoolNodes = 10000
+	// deletedVolumePoolNodeTTL is how long the controller remembers the
+	// address of a deleted node. Substrate unpublishes the volumes of a node
+	// that is gone when it suspends or deletes their actors, well within it.
+	deletedVolumePoolNodeTTL = 24 * time.Hour
+)
 
 // informerNodeIPResolver looks nodes up in a Node informer's cache, so that a
 // lookup usually makes no API call. When the cache can't answer, because it
 // hasn't synced yet or doesn't have the node yet, it gets the node from the API
-// server.
+// server. It also remembers the addresses of the nodes that the informer sees
+// deleted.
 type informerNodeIPResolver struct {
 	lister corelisters.NodeLister
 	synced cache.InformerSynced
 	client kubernetes.Interface
+	// deleted maps the names of recently deleted nodes to the internal IPv4
+	// addresses they had.
+	deleted *utilcache.LRUExpireCache
 }
 
 // newInformerNodeIPResolver returns a resolver backed by factory's Node
@@ -622,11 +659,50 @@ func newInformerNodeIPResolver(factory informers.SharedInformerFactory, client k
 		// the factory starts later, with the controller.
 		klog.Warningf("The node cache for publishing Volume Pool volumes keeps whole Node objects: %v", err)
 	}
-	return &informerNodeIPResolver{
-		lister: nodes.Lister(),
-		synced: informer.HasSynced,
-		client: client,
+	r := &informerNodeIPResolver{
+		lister:  nodes.Lister(),
+		synced:  informer.HasSynced,
+		client:  client,
+		deleted: utilcache.NewLRUExpireCache(maxDeletedVolumePoolNodes),
 	}
+	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{DeleteFunc: r.nodeDeleted}); err != nil {
+		// AddEventHandler fails only once the informer has stopped.
+		klog.Warningf("Unpublishing Volume Pool volumes won't know the addresses of deleted nodes: %v", err)
+	}
+	return r
+}
+
+// nodeDeleted remembers the internal IPv4 address of obj, a deleted Node or the
+// tombstone of one.
+func (r *informerNodeIPResolver) nodeDeleted(obj interface{}) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	node, ok := obj.(*v1.Node)
+	if !ok {
+		return
+	}
+	if ip, err := nodeInternalIPv4(node); err == nil {
+		r.deleted.Add(node.Name, ip, deletedVolumePoolNodeTTL)
+	}
+}
+
+func (r *informerNodeIPResolver) DeletedNodeIP(nodeName string) (string, bool) {
+	v, ok := r.deleted.Get(nodeName)
+	if !ok || !r.synced() {
+		return "", false
+	}
+	ip := v.(string)
+	nodes, err := r.lister.List(labels.Everything())
+	if err != nil {
+		return "", false
+	}
+	for _, node := range nodes {
+		if nodeIP, err := nodeInternalIPv4(node); err == nil && nodeIP == ip {
+			return "", false
+		}
+	}
+	return ip, true
 }
 
 // stripVolumePoolNode returns a copy of the Node obj with only what NodeIP

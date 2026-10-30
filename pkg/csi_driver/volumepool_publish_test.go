@@ -37,6 +37,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilcache "k8s.io/apimachinery/pkg/util/cache"
 	"k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
@@ -116,6 +117,88 @@ func TestInformerNodeIPResolver(t *testing.T) {
 		t.Fatalf("failed to delete node-a: %v", err)
 	}
 	waitForNodeIP(t, nodes.ips, "node-a", "", codes.NotFound)
+
+	// The resolver remembers the address that node-a had when it was
+	// deleted, until another node has it.
+	waitForDeletedNodeIP(t, nodes.ips, "node-a", "10.128.0.99", true)
+	if _, err := client.CoreV1().Nodes().Create(ctx, testNode("node-z", v1.NodeAddress{Type: v1.NodeInternalIP, Address: "10.128.0.99"}), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create node-z: %v", err)
+	}
+	waitForDeletedNodeIP(t, nodes.ips, "node-a", "", false)
+}
+
+// waitForDeletedNodeIP waits until r reports wantIP and wantOK for the deleted
+// node, which it does once the API server's change reaches the node cache. It
+// fails the test if that takes more than 10 seconds.
+func waitForDeletedNodeIP(t *testing.T, r nodeIPResolver, node, wantIP string, wantOK bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ip, ok := r.DeletedNodeIP(node)
+		if ip == wantIP && ok == wantOK {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("DeletedNodeIP(%q) = %q, %v; want %q, %v", node, ip, ok, wantIP, wantOK)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// fakeClock is a utilcache.Clock whose time the test sets.
+type fakeClock struct{ now time.Time }
+
+func (c *fakeClock) Now() time.Time { return c.now }
+
+func TestInformerNodeIPResolver_DeletedNodeIP(t *testing.T) {
+	// node-b, which is in the cache, now has the address that node-old had.
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := indexer.Add(testNode("node-b", v1.NodeAddress{Type: v1.NodeInternalIP, Address: ipB})); err != nil {
+		t.Fatalf("failed to cache node-b: %v", err)
+	}
+	synced := true
+	clock := &fakeClock{now: time.Now()}
+	r := &informerNodeIPResolver{
+		lister:  corelisters.NewNodeLister(indexer),
+		synced:  func() bool { return synced },
+		deleted: utilcache.NewLRUExpireCacheWithClock(maxDeletedVolumePoolNodes, clock),
+	}
+	r.nodeDeleted(testNode("node-gone", v1.NodeAddress{Type: v1.NodeInternalIP, Address: ipD}))
+	// A tombstone for a node deleted while the informer was disconnected.
+	r.nodeDeleted(cache.DeletedFinalStateUnknown{Key: "node-missed", Obj: testNode("node-missed", v1.NodeAddress{Type: v1.NodeInternalIP, Address: ipC})})
+	r.nodeDeleted(cache.DeletedFinalStateUnknown{Key: "node-unknown"})
+	r.nodeDeleted(testNode("node-old", v1.NodeAddress{Type: v1.NodeInternalIP, Address: ipB}))
+	r.nodeDeleted(testNode("node-ipv6", v1.NodeAddress{Type: v1.NodeInternalIP, Address: "fd00::1"}))
+
+	for _, tc := range []struct {
+		node   string
+		wantIP string
+		wantOK bool
+	}{
+		{node: "node-gone", wantIP: ipD, wantOK: true},
+		{node: "node-missed", wantIP: ipC, wantOK: true},
+		{node: "node-unknown"},
+		{node: "node-old"},  // node-b has its address now
+		{node: "node-ipv6"}, // it had no IPv4 address
+		{node: "node-b"},    // not deleted
+	} {
+		if ip, ok := r.DeletedNodeIP(tc.node); ip != tc.wantIP || ok != tc.wantOK {
+			t.Errorf("DeletedNodeIP(%q) = %q, %v; want %q, %v", tc.node, ip, ok, tc.wantIP, tc.wantOK)
+		}
+	}
+
+	// Until the cache syncs, it can't tell which nodes have the address now.
+	synced = false
+	if ip, ok := r.DeletedNodeIP("node-gone"); ok {
+		t.Errorf("DeletedNodeIP(node-gone) before the cache synced = %q, true; want false", ip)
+	}
+	synced = true
+
+	// The resolver forgets deleted nodes after a day.
+	clock.now = clock.now.Add(deletedVolumePoolNodeTTL + time.Second)
+	if ip, ok := r.DeletedNodeIP("node-gone"); ok {
+		t.Errorf("DeletedNodeIP(node-gone) a day after the deletion = %q, true; want false", ip)
+	}
 }
 
 // waitForNodeIP waits until r looks node up as wantIP with an error of code
@@ -462,6 +545,20 @@ func (f fakeNodeIPs) NodeIP(_ context.Context, nodeName string) (string, error) 
 	return ip, nil
 }
 
+func (fakeNodeIPs) DeletedNodeIP(string) (string, bool) { return "", false }
+
+// fakeNodeIPsWithDeleted adds nodes deleted recently, mapped to the IP
+// addresses they had, to fakeNodeIPs.
+type fakeNodeIPsWithDeleted struct {
+	fakeNodeIPs
+	deleted map[string]string
+}
+
+func (f fakeNodeIPsWithDeleted) DeletedNodeIP(nodeName string) (string, bool) {
+	ip, ok := f.deleted[nodeName]
+	return ip, ok
+}
+
 // unavailableNodeIPs fails every lookup, as the node lookup does when neither
 // the node cache nor the API server can answer.
 type unavailableNodeIPs struct{}
@@ -469,6 +566,8 @@ type unavailableNodeIPs struct{}
 func (unavailableNodeIPs) NodeIP(context.Context, string) (string, error) {
 	return "", status.Error(codes.Unavailable, "failed to get node: the API server can't be reached")
 }
+
+func (unavailableNodeIPs) DeletedNodeIP(string) (string, bool) { return "", false }
 
 // publishTestService wraps volumePoolTestService to count, and optionally
 // override, IP ACL updates.
@@ -503,6 +602,7 @@ const (
 	ipA = "10.128.0.11"
 	ipB = "10.128.0.12"
 	ipC = "10.128.0.13"
+	ipD = "10.128.0.14"
 )
 
 // newPublishTestController returns a controller whose volume pool has the HOT
@@ -1072,6 +1172,35 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA)},
 			nodeID:      "node-missing",
 			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipA)},
+		},
+		{
+			// node-gone is gone, but the controller saw it deleted.
+			name:        "removes the address of a deleted node",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipD)},
+			setup: func(cs *controllerServer, _ *publishTestService) {
+				cs.config.volumePoolNodes = &volumePoolNodes{ips: fakeNodeIPsWithDeleted{
+					fakeNodeIPs: fakeNodeIPs{"node-a": ipA},
+					deleted:     map[string]string{"node-gone": ipD},
+				}}
+			},
+			nodeID:      "node-gone",
+			wantAcls:    nil,
+			wantUpdates: 1,
+		},
+		{
+			// GKE deleted node-a and created it again with address ipA; it
+			// had address ipD before.
+			name:        "removes the old and new addresses of a node created again",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipD), rw(ipA), rw(ipB)},
+			setup: func(cs *controllerServer, _ *publishTestService) {
+				cs.config.volumePoolNodes = &volumePoolNodes{ips: fakeNodeIPsWithDeleted{
+					fakeNodeIPs: fakeNodeIPs{"node-a": ipA, "node-b": ipB},
+					deleted:     map[string]string{"node-a": ipD},
+				}}
+			},
+			nodeID:      "node-a",
+			wantAcls:    []file.VolumePoolNfsExportOptions{rw(ipB)},
+			wantUpdates: 1,
 		},
 		{
 			name:        "node without an IPv4 address leaves the IP ACLs",
