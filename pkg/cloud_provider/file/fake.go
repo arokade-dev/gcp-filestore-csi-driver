@@ -697,8 +697,11 @@ func copyVolumePoolAcls(acls []VolumePoolNfsExportOptions) []VolumePoolNfsExport
 
 // UpdateVolumePoolVolumeIpAcls replaces a volume's IP ACLs like the API does:
 // only HOT volumes (or volumes with no reported state) can be updated, and the
-// rules must be valid: IPv4 ranges only, at most 64 of them, no duplicates, and
-// anon IDs only with ROOT_SQUASH.
+// rules must be valid: every entry has IP ranges, which are IPv4, at most 64 in
+// all and no two equal, and anon IDs come only with ROOT_SQUASH. Like the API,
+// it compares IP ranges as networks, an address being a /32 one: x and x/32 are
+// equal, and so are 10.0.0.1/8 and 10.0.0.0/8, while ranges that only overlap,
+// such as 10.0.0.0/8 and 10.0.0.0/16, are allowed.
 func (manager *fakeServiceManager) UpdateVolumePoolVolumeIpAcls(ctx context.Context, name string, acls []VolumePoolNfsExportOptions) (*PoolVolume, error) {
 	vol, ok := manager.allocatedVolumes[name]
 	if !ok {
@@ -710,34 +713,50 @@ func (manager *fakeServiceManager) UpdateVolumePoolVolumeIpAcls(ctx context.Cont
 		return nil, status.Errorf(codes.FailedPrecondition, "fake: volume %q is %s; only HOT volumes can have their IP ACLs updated", name, vol.State)
 	}
 
-	seen := map[string]bool{}
+	var networks []string
 	for _, acl := range acls {
+		if len(acl.IpRanges) == 0 {
+			return nil, status.Error(codes.InvalidArgument, "fake: IP ranges must be set in NFS export options")
+		}
+		for _, r := range acl.IpRanges {
+			network, ok := ipv4Network(r)
+			if !ok {
+				return nil, status.Errorf(codes.InvalidArgument, "fake: %q is not an IPv4 address or range", r)
+			}
+			networks = append(networks, network)
+		}
 		if (acl.AnonUid != 0 || acl.AnonGid != 0) && acl.SquashMode != "ROOT_SQUASH" {
 			return nil, status.Errorf(codes.InvalidArgument, "fake: anon IDs require ROOT_SQUASH")
 		}
-		for _, r := range acl.IpRanges {
-			if !isIPv4Range(r) {
-				return nil, status.Errorf(codes.InvalidArgument, "fake: %q is not an IPv4 address or range", r)
-			}
-			if seen[r] {
-				return nil, status.Errorf(codes.InvalidArgument, "fake: IP range %q is listed more than once", r)
-			}
-			seen[r] = true
-		}
 	}
-	if len(seen) > 64 {
-		return nil, status.Errorf(codes.InvalidArgument, "fake: %d IP ranges, at most 64 are allowed", len(seen))
+	if len(networks) > 64 {
+		return nil, status.Errorf(codes.InvalidArgument, "fake: %d IP ranges, at most 64 are allowed", len(networks))
+	}
+	seen := map[string]bool{}
+	for _, network := range networks {
+		if seen[network] {
+			return nil, status.Errorf(codes.InvalidArgument, "fake: IP range %s was used multiple times, only one use is allowed", network)
+		}
+		seen[network] = true
 	}
 
 	vol.IpAcls = copyVolumePoolAcls(acls)
 	return copyPoolVolume(vol), nil
 }
 
-// isIPv4Range reports whether r is an IPv4 address or an IPv4 CIDR range.
-func isIPv4Range(r string) bool {
+// ipv4Network returns the IPv4 address or range r as the network that the API
+// compares IP ranges as: an address is a /32 network, and a range is reduced to
+// its network address. ok is false if r isn't an IPv4 address or range.
+func ipv4Network(r string) (network string, ok bool) {
 	if ip := net.ParseIP(r); ip != nil {
-		return ip.To4() != nil
+		if ip.To4() == nil {
+			return "", false
+		}
+		r += "/32"
 	}
-	ip, _, err := net.ParseCIDR(r)
-	return err == nil && ip.To4() != nil
+	ip, ipNet, err := net.ParseCIDR(r)
+	if err != nil || ip.To4() == nil {
+		return "", false
+	}
+	return ipNet.String(), true
 }

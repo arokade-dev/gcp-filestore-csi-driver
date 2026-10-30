@@ -1881,3 +1881,91 @@ func TestGetVolumePoolVolume_IpAcls(t *testing.T) {
 		t.Errorf("IpAcls mismatch (-want +got):\n%s", diff)
 	}
 }
+
+// The fake checks IP ACLs like the API does, so that tests can't put a volume
+// in a state that the API would refuse.
+func TestFakeUpdateVolumePoolVolumeIpAcls(t *testing.T) {
+	const pool = "projects/test-project/locations/us-central1/volumePools/test-pool"
+	name := pool + "/volumes/vol-1"
+	entry := func(ipRanges ...string) VolumePoolNfsExportOptions {
+		return VolumePoolNfsExportOptions{
+			IpRanges:        ipRanges,
+			AccessMode:      VolumePoolAccessModeReadWrite,
+			SquashMode:      VolumePoolSquashModeNoRoot,
+			SecurityFlavors: []string{VolumePoolSecurityFlavorAuthSys},
+		}
+	}
+	withAnonIDs := func(acl VolumePoolNfsExportOptions, squashMode string) VolumePoolNfsExportOptions {
+		acl.SquashMode = squashMode
+		acl.AnonUid, acl.AnonGid = 1000, 1001
+		return acl
+	}
+	var tooMany []string
+	for i := 1; i <= 65; i++ {
+		tooMany = append(tooMany, fmt.Sprintf("10.0.0.%d", i))
+	}
+
+	for _, tc := range []struct {
+		name string
+		// volume is the volume to update, vol-1 if empty, and state is
+		// vol-1's state, HOT if empty.
+		volume   string
+		state    string
+		acls     []VolumePoolNfsExportOptions
+		wantCode codes.Code
+	}{
+		{name: "nodes and a wider range", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry("10.128.0.12/32"), entry("192.168.0.0/16")}},
+		{name: "no entries", acls: nil},
+		{name: "ranges that only overlap", acls: []VolumePoolNfsExportOptions{entry("10.0.0.0/8"), entry("10.0.0.0/16")}},
+		{name: "anon IDs with ROOT_SQUASH", acls: []VolumePoolNfsExportOptions{withAnonIDs(entry("10.0.0.0/8"), "ROOT_SQUASH")}},
+		{name: "an address twice", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry("10.128.0.11")}, wantCode: codes.InvalidArgument},
+		{name: "an address and its /32 range", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry("10.128.0.11/32")}, wantCode: codes.InvalidArgument},
+		{name: "a range written two ways", acls: []VolumePoolNfsExportOptions{entry("10.0.0.0/8", "10.0.0.1/8")}, wantCode: codes.InvalidArgument},
+		{name: "IPv6 address", acls: []VolumePoolNfsExportOptions{entry("fd00::1")}, wantCode: codes.InvalidArgument},
+		{name: "not an address", acls: []VolumePoolNfsExportOptions{entry("node-a")}, wantCode: codes.InvalidArgument},
+		{name: "65 ranges", acls: []VolumePoolNfsExportOptions{entry(tooMany...)}, wantCode: codes.InvalidArgument},
+		{name: "entry without IP ranges", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry()}, wantCode: codes.InvalidArgument},
+		{name: "anon IDs without ROOT_SQUASH", acls: []VolumePoolNfsExportOptions{withAnonIDs(entry("10.0.0.0/8"), VolumePoolSquashModeNoRoot)}, wantCode: codes.InvalidArgument},
+		{name: "WARM volume", state: VolumePoolVolumeStateWarm, acls: []VolumePoolNfsExportOptions{entry("10.128.0.11")}, wantCode: codes.FailedPrecondition},
+		{name: "volume not found", volume: pool + "/volumes/missing", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11")}, wantCode: codes.NotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, err := NewFakeService()
+			if err != nil {
+				t.Fatalf("NewFakeService() error = %v", err)
+			}
+			manager := s.(*fakeServiceManager)
+			if _, err := manager.CreateVolumePoolVolume(ctx, pool, "vol-1"); err != nil {
+				t.Fatalf("CreateVolumePoolVolume() error = %v", err)
+			}
+			if tc.state != "" {
+				manager.allocatedVolumes[name].State = tc.state
+			}
+			before := copyVolumePoolAcls(manager.allocatedVolumes[name].IpAcls)
+			volume := tc.volume
+			if volume == "" {
+				volume = name
+			}
+
+			got, err := manager.UpdateVolumePoolVolumeIpAcls(ctx, volume, tc.acls)
+			if code := status.Code(err); code != tc.wantCode {
+				t.Fatalf("UpdateVolumePoolVolumeIpAcls() error = %v (code %v), want code %v", err, code, tc.wantCode)
+			}
+			stored := manager.allocatedVolumes[name].IpAcls
+			if err != nil {
+				// A refused update leaves the IP ACLs as they were.
+				if diff := cmp.Diff(before, stored); diff != "" {
+					t.Errorf("IP ACLs changed although the update was refused (-before +after):\n%s", diff)
+				}
+				return
+			}
+			if diff := cmp.Diff(tc.acls, got.IpAcls); diff != "" {
+				t.Errorf("returned IP ACLs mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.acls, stored); diff != "" {
+				t.Errorf("stored IP ACLs mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
