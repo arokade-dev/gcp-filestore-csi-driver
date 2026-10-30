@@ -1876,7 +1876,11 @@ func canonicalCode(apiErr *googleapi.Error) (codes.Code, bool) {
 }
 
 // VolumePoolNfsExportOptions is one IP ACL rule of a volume pool volume: the
-// NFS export options for the clients in IpRanges.
+// NFS export options for the clients in IpRanges. It mirrors every field of the
+// API's NfsExportOptions, even those that publishing never sets, such as the
+// anon IDs and the network: an update replaces the whole list of rules, so the
+// rules that publishing keeps, such as those set by hand, must be written back
+// exactly as they were read.
 type VolumePoolNfsExportOptions struct {
 	IpRanges        []string `json:"ipRanges,omitempty"`
 	AccessMode      string   `json:"accessMode,omitempty"`
