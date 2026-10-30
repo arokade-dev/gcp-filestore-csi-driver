@@ -110,8 +110,10 @@ type GCFSDriverFeatureOptions struct {
 type FeatureVolumePools struct {
 	Enabled bool
 	// KubeClient lets the controller look up Kubernetes Nodes, to find the IP
-	// address that volume pool volumes are published to. It is required when
-	// Enabled is set on a controller.
+	// address that volume pool volumes are published to. A controller needs
+	// it when Enabled is set: without it, ControllerPublishVolume and
+	// ControllerUnpublishVolume of volume pool volumes return Internal. The
+	// driver's main always sets it.
 	KubeClient kubernetes.Interface
 }
 

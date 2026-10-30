@@ -172,7 +172,10 @@ type controllerServerConfig struct {
 	extraVolumeLabels    map[string]string
 	tagManager           cloud.TagService
 	// volumePoolNodes looks up the nodes that volume pool volumes are
-	// published to. It is nil when the Volume Pools feature is off.
+	// published to. It is nil when the Volume Pools feature is off, and when
+	// the feature has no Kubernetes client, as in tests. Publishing a volume
+	// pool volume without it returns Internal, or Unimplemented when the
+	// feature is off.
 	volumePoolNodes *volumePoolNodes
 }
 
