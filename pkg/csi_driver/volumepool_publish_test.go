@@ -44,6 +44,7 @@ import (
 	"k8s.io/klog/v2"
 	cloud "sigs.k8s.io/gcp-filestore-csi-driver/pkg/cloud_provider"
 	"sigs.k8s.io/gcp-filestore-csi-driver/pkg/cloud_provider/file"
+	"sigs.k8s.io/gcp-filestore-csi-driver/pkg/metrics"
 )
 
 func testNode(name string, addresses ...v1.NodeAddress) *v1.Node {
@@ -96,6 +97,42 @@ func TestInformerNodeIPResolver(t *testing.T) {
 				t.Errorf("NodeIP(%q) = %q, want %q", tc.node, ip, tc.wantIP)
 			}
 		})
+	}
+
+	// The cache follows changes to nodes: a node whose VM GKE recreates keeps
+	// its name, but can get another IP address.
+	ctx := context.Background()
+	nodeA, err := client.CoreV1().Nodes().Get(ctx, "node-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get node-a: %v", err)
+	}
+	nodeA.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: "10.128.0.99"}}
+	if _, err := client.CoreV1().Nodes().Update(ctx, nodeA, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("failed to update node-a: %v", err)
+	}
+	waitForNodeIP(t, nodes.ips, "node-a", "10.128.0.99", codes.OK)
+
+	if err := client.CoreV1().Nodes().Delete(ctx, "node-a", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("failed to delete node-a: %v", err)
+	}
+	waitForNodeIP(t, nodes.ips, "node-a", "", codes.NotFound)
+}
+
+// waitForNodeIP waits until r looks node up as wantIP with an error of code
+// wantCode, which the node cache does once the API server's change reaches it.
+// It fails the test if that takes more than 10 seconds.
+func waitForNodeIP(t *testing.T, r nodeIPResolver, node, wantIP string, wantCode codes.Code) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ip, err := r.NodeIP(context.Background(), node)
+		if ip == wantIP && status.Code(err) == wantCode {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("NodeIP(%q) = %q, %v; want %q, code %v", node, ip, err, wantIP, wantCode)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -425,6 +462,14 @@ func (f fakeNodeIPs) NodeIP(_ context.Context, nodeName string) (string, error) 
 	return ip, nil
 }
 
+// unavailableNodeIPs fails every lookup, as the node lookup does when neither
+// the node cache nor the API server can answer.
+type unavailableNodeIPs struct{}
+
+func (unavailableNodeIPs) NodeIP(context.Context, string) (string, error) {
+	return "", status.Error(codes.Unavailable, "failed to get node: the API server can't be reached")
+}
+
 // publishTestService wraps volumePoolTestService to count, and optionally
 // override, IP ACL updates.
 type publishTestService struct {
@@ -745,6 +790,14 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			wantCode: codes.Internal,
 		},
 		{
+			name: "node lookup unavailable",
+			setup: func(cs *controllerServer, _ *publishTestService) {
+				cs.config.volumePoolNodes = &volumePoolNodes{ips: unavailableNodeIPs{}}
+			},
+			req:      publishRequest("node-a", snw),
+			wantCode: codes.Unavailable,
+		},
+		{
 			name: "volume not found",
 			req: func() *csi.ControllerPublishVolumeRequest {
 				req := publishRequest("node-a", snw)
@@ -876,6 +929,7 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(cs, fs)
 			}
+			before := testVolumeIpAcls(t, fs)
 
 			resp, err := cs.ControllerPublishVolume(ctx, tc.req)
 			expectCode(t, err, tc.wantCode)
@@ -885,8 +939,15 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			if got := fs.calls["UpdateVolumePoolVolumeIpAcls"]; got != tc.wantUpdates {
 				t.Errorf("IP ACLs updated %d times, want %d", got, tc.wantUpdates)
 			}
+			after := testVolumeIpAcls(t, fs)
+			if err != nil {
+				// A failed publish leaves the IP ACLs as they were.
+				if diff := cmp.Diff(before, after); diff != "" {
+					t.Errorf("IP ACLs changed although the publish failed (-before +after):\n%s", diff)
+				}
+			}
 			if tc.wantAcls != nil {
-				if diff := cmp.Diff(tc.wantAcls, testVolumeIpAcls(t, fs)); diff != "" {
+				if diff := cmp.Diff(tc.wantAcls, after); diff != "" {
 					t.Errorf("IP ACLs mismatch (-want +got):\n%s", diff)
 				}
 			}
@@ -1026,7 +1087,17 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 			},
 			nodeID:   "node-a",
 			wantCode: codes.Internal,
-			wantAcls: []file.VolumePoolNfsExportOptions{rw(ipA)},
+		},
+		{
+			// Unlike a node that is gone, a lookup that fails doesn't tell
+			// whether the node can still mount the volume.
+			name:        "node lookup unavailable",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA)},
+			setup: func(cs *controllerServer, _ *publishTestService) {
+				cs.config.volumePoolNodes = &volumePoolNodes{ips: unavailableNodeIPs{}}
+			},
+			nodeID:   "node-a",
+			wantCode: codes.Unavailable,
 		},
 		{
 			name:     "volume not found",
@@ -1049,6 +1120,15 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 			name: "WARM volume",
 			setup: func(_ *controllerServer, fs *publishTestService) {
 				fs.getVolume = volumeWithIpAcls(file.VolumePoolVolumeStateWarm, rw(ipA))
+			},
+			nodeID: "node-a",
+		},
+		{
+			// A volume being created can't have been published yet, so
+			// there is nothing to remove.
+			name: "volume still being created",
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.getVolume = volumeInState(file.VolumePoolVolumeStateCreating)
 			},
 			nodeID: "node-a",
 		},
@@ -1120,14 +1200,22 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 			if volumeID == "" {
 				volumeID = testSourceVolumeID
 			}
+			before := testVolumeIpAcls(t, fs)
 
 			_, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: volumeID, NodeId: tc.nodeID})
 			expectCode(t, err, tc.wantCode)
 			if got := fs.calls["UpdateVolumePoolVolumeIpAcls"]; got != tc.wantUpdates {
 				t.Errorf("IP ACLs updated %d times, want %d", got, tc.wantUpdates)
 			}
-			if tc.initialAcls != nil && tc.wantCode != codes.Aborted {
-				if diff := cmp.Diff(tc.wantAcls, testVolumeIpAcls(t, fs)); diff != "" {
+			after := testVolumeIpAcls(t, fs)
+			switch {
+			case err != nil:
+				// A failed unpublish leaves the IP ACLs as they were.
+				if diff := cmp.Diff(before, after); diff != "" {
+					t.Errorf("IP ACLs changed although the unpublish failed (-before +after):\n%s", diff)
+				}
+			case tc.initialAcls != nil:
+				if diff := cmp.Diff(tc.wantAcls, after); diff != "" {
 					t.Errorf("IP ACLs mismatch (-want +got):\n%s", diff)
 				}
 			}
@@ -1231,6 +1319,50 @@ func TestPublishedVolumePoolIpAcls_Evicted(t *testing.T) {
 				t.Errorf("evicted IP ranges mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// A single-node publish that replaces another node's entry counts an eviction
+// in filestorecsi_volume_pool_publish_eviction_count. Replacing the rule of a
+// new volume, or publishing again, doesn't.
+func TestControllerPublishVolume_CountsEvictions(t *testing.T) {
+	ctx := context.Background()
+	mm := metrics.NewMetricsManager()
+	mm.RegisterVolumePoolPublishEvictionCountMetric()
+	cs, _ := newPublishTestController(t)
+	cs.config.metricsManager = mm
+	// The counter is global, so other tests may have counted evictions too.
+	evictions := func() float64 {
+		t.Helper()
+		families, err := mm.GetRegistry().Gather()
+		if err != nil {
+			t.Fatalf("failed to gather metrics: %v", err)
+		}
+		for _, f := range families {
+			if f.GetName() == "filestorecsi_volume_pool_publish_eviction_count" && len(f.GetMetric()) == 1 {
+				return f.GetMetric()[0].GetCounter().GetValue()
+			}
+		}
+		t.Fatalf("the metrics don't have filestorecsi_volume_pool_publish_eviction_count: %v", families)
+		return 0
+	}
+	start := evictions()
+
+	for _, step := range []struct {
+		node string
+		// want is the number of evictions counted since the start.
+		want float64
+	}{
+		{node: "node-a", want: 0}, // replaces the rule of a new volume
+		{node: "node-a", want: 0}, // publishes again
+		{node: "node-b", want: 1}, // replaces node-a
+	} {
+		if _, err := cs.ControllerPublishVolume(ctx, publishRequest(step.node, csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
+			t.Fatalf("ControllerPublishVolume(%s) error = %v", step.node, err)
+		}
+		if got := evictions() - start; got != step.want {
+			t.Errorf("after publishing to %s: %v evictions counted, want %v", step.node, got, step.want)
+		}
 	}
 }
 
