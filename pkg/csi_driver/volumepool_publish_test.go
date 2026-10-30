@@ -1224,3 +1224,88 @@ func TestIsSingleIPRange(t *testing.T) {
 		}
 	}
 }
+
+func TestVolumePoolIpAclsString(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		acls []file.VolumePoolNfsExportOptions
+		want string
+	}{
+		{name: "no entries", want: "[]"},
+		{
+			name: "a published node",
+			acls: []file.VolumePoolNfsExportOptions{rw(ipA)},
+			want: "[10.128.0.11 access=READ_WRITE squash=NO_ROOT_SQUASH flavors=AUTH_SYS]",
+		},
+		{
+			name: "a new volume's rule and a read-only node",
+			acls: append(newVolumeIpAcls(), ro(ipB)),
+			want: "[10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 access=READ_WRITE squash=NO_ROOT_SQUASH flavors=AUTH_SYS; 10.128.0.12 access=READ_ONLY squash=NO_ROOT_SQUASH flavors=AUTH_SYS]",
+		},
+		{
+			name: "unset settings",
+			acls: []file.VolumePoolNfsExportOptions{{IpRanges: []string{ipA}}},
+			want: "[10.128.0.11 access=unset squash=unset flavors=unset]",
+		},
+		{
+			name: "anon IDs and network",
+			acls: []file.VolumePoolNfsExportOptions{{
+				IpRanges:        []string{"10.0.0.0/24"},
+				AccessMode:      file.VolumePoolAccessModeReadWrite,
+				SquashMode:      "ROOT_SQUASH",
+				AnonUid:         1000,
+				AnonGid:         1001,
+				SecurityFlavors: []string{"AUTH_SYS", "KRB5"},
+				Network:         "default",
+			}},
+			want: "[10.0.0.0/24 access=READ_WRITE squash=ROOT_SQUASH flavors=AUTH_SYS,KRB5 anonUid=1000 anonGid=1001 network=default]",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := volumePoolIpAclsString(tc.acls); got != tc.want {
+				t.Errorf("volumePoolIpAclsString() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The logs of a publish or unpublish that changes the IP ACLs show every
+// setting of the entries, so that they show a change to a setting other than
+// the IP ranges, such as the security flavor here.
+func TestControllerPublishUnpublish_LogsIpAcls(t *testing.T) {
+	ctx := context.Background()
+	logs := captureKlog(t)
+	cs, fs := newPublishTestController(t)
+	setTestVolumeIpAcls(t, fs, []file.VolumePoolNfsExportOptions{{
+		IpRanges:   []string{ipA},
+		AccessMode: file.VolumePoolAccessModeReadWrite,
+		SquashMode: file.VolumePoolSquashModeNoRoot,
+	}})
+	const (
+		withoutFlavor = "10.128.0.11 access=READ_WRITE squash=NO_ROOT_SQUASH flavors=unset"
+		nodeA         = "10.128.0.11 access=READ_WRITE squash=NO_ROOT_SQUASH flavors=AUTH_SYS"
+		nodeB         = "10.128.0.12 access=READ_WRITE squash=NO_ROOT_SQUASH flavors=AUTH_SYS"
+	)
+
+	if _, err := cs.ControllerPublishVolume(ctx, publishRequest("node-a", csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)); err != nil {
+		t.Fatalf("ControllerPublishVolume() error = %v", err)
+	}
+	if _, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: testSourceVolumeID, NodeId: "node-a"}); err != nil {
+		t.Fatalf("ControllerUnpublishVolume() error = %v", err)
+	}
+	setTestVolumeIpAcls(t, fs, []file.VolumePoolNfsExportOptions{rw(ipA), rw(ipB)})
+	if _, err := cs.ControllerUnpublishVolume(ctx, &csi.ControllerUnpublishVolumeRequest{VolumeId: testSourceVolumeID}); err != nil {
+		t.Fatalf("ControllerUnpublishVolume() for every node error = %v", err)
+	}
+
+	got := logs()
+	for _, want := range []string{
+		fmt.Sprintf("Published Volume Pool volume %q to node %q (%s): its IP ACLs went from [%s] to [%s]", testSourceVolumeName, "node-a", ipA, withoutFlavor, nodeA),
+		fmt.Sprintf("Unpublished Volume Pool volume %q from node %q (%s): its IP ACLs went from [%s] to []", testSourceVolumeName, "node-a", ipA, nodeA),
+		fmt.Sprintf("Unpublished Volume Pool volume %q from every node: its IP ACLs went from [%s; %s] to []", testSourceVolumeName, nodeA, nodeB),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("logs don't contain %q:\n%s", want, got)
+		}
+	}
+}

@@ -161,7 +161,7 @@ func (s *controllerServer) publishVolumePoolVolume(ctx context.Context, req *csi
 	if err := s.updateVolumePoolIpAcls(ctx, name, acls); err != nil {
 		return err
 	}
-	klog.Infof("Published Volume Pool volume %q to node %q (%s): the IP ranges it is exported to went from [%s] to [%s]", name, nodeID, nodeIP, strings.Join(volumePoolIpAclRanges(vol.IpAcls), ", "), strings.Join(volumePoolIpAclRanges(acls), ", "))
+	klog.Infof("Published Volume Pool volume %q to node %q (%s): its IP ACLs went from %s to %s", name, nodeID, nodeIP, volumePoolIpAclsString(vol.IpAcls), volumePoolIpAclsString(acls))
 	return nil
 }
 
@@ -196,6 +196,7 @@ func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *c
 
 	// An empty node ID unpublishes the volume from every node.
 	var acls []file.VolumePoolNfsExportOptions
+	nodes := "every node"
 	if nodeID != "" {
 		nodeIP, err := s.volumePoolNodeIP(ctx, nodeID)
 		if err != nil {
@@ -206,6 +207,7 @@ func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *c
 			return err
 		}
 		acls = volumePoolIpAclsWithout(vol.IpAcls, nodeIP)
+		nodes = fmt.Sprintf("node %q (%s)", nodeID, nodeIP)
 	}
 	if equalVolumePoolIpAcls(acls, vol.IpAcls) {
 		klog.V(4).Infof("Volume Pool volume %q is not published to node %q", name, nodeID)
@@ -221,7 +223,7 @@ func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *c
 		}
 		return err
 	}
-	klog.Infof("Unpublished Volume Pool volume %q from node %q", name, nodeID)
+	klog.Infof("Unpublished Volume Pool volume %q from %s: its IP ACLs went from %s to %s", name, nodes, volumePoolIpAclsString(vol.IpAcls), volumePoolIpAclsString(acls))
 	return nil
 }
 
@@ -457,6 +459,37 @@ func volumePoolIpAclRanges(acls []file.VolumePoolNfsExportOptions) []string {
 		ranges = append(ranges, acl.IpRanges...)
 	}
 	return ranges
+}
+
+// volumePoolIpAclsString returns acls as logs show them: each entry's IP
+// ranges with all its settings, so that a log shows any change to an entry,
+// not only to its IP ranges. Unset settings show as "unset"; anon IDs and the
+// network show only when set.
+func volumePoolIpAclsString(acls []file.VolumePoolNfsExportOptions) string {
+	entries := make([]string, 0, len(acls))
+	for _, acl := range acls {
+		entry := fmt.Sprintf("%s access=%s squash=%s flavors=%s",
+			unsetIfEmpty(strings.Join(acl.IpRanges, ",")),
+			unsetIfEmpty(acl.AccessMode),
+			unsetIfEmpty(acl.SquashMode),
+			unsetIfEmpty(strings.Join(acl.SecurityFlavors, ",")))
+		if acl.AnonUid != 0 || acl.AnonGid != 0 {
+			entry += fmt.Sprintf(" anonUid=%d anonGid=%d", acl.AnonUid, acl.AnonGid)
+		}
+		if acl.Network != "" {
+			entry += " network=" + acl.Network
+		}
+		entries = append(entries, entry)
+	}
+	return "[" + strings.Join(entries, "; ") + "]"
+}
+
+// unsetIfEmpty returns s, or "unset" if s is empty.
+func unsetIfEmpty(s string) string {
+	if s == "" {
+		return "unset"
+	}
+	return s
 }
 
 // equalVolumePoolIpAcls reports whether a and b are the same IP ACLs, in the
