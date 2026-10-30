@@ -440,6 +440,20 @@ func (s *publishTestService) UpdateVolumePoolVolumeIpAcls(ctx context.Context, n
 	return s.volumePoolTestService.UpdateVolumePoolVolumeIpAcls(ctx, name, acls)
 }
 
+// volumeWithIpAcls returns a getVolume override that reports every volume in
+// state, with IP ACLs acls.
+func volumeWithIpAcls(state string, acls ...file.VolumePoolNfsExportOptions) func(context.Context, string) (*file.PoolVolume, error) {
+	inState := volumeInState(state)
+	return func(ctx context.Context, name string) (*file.PoolVolume, error) {
+		vol, err := inState(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		vol.IpAcls = acls
+		return vol, nil
+	}
+}
+
 const (
 	ipA = "10.128.0.11"
 	ipB = "10.128.0.12"
@@ -1020,9 +1034,21 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 			nodeID:   "node-a",
 		},
 		{
+			// A COLD volume has no IP ACLs: the API requires them to be
+			// empty to freeze it. If they listed the node anyway,
+			// unpublishing wouldn't update them.
 			name: "COLD volume",
 			setup: func(_ *controllerServer, fs *publishTestService) {
-				fs.getVolume = volumeInState(file.VolumePoolVolumeStateCold)
+				fs.getVolume = volumeWithIpAcls(file.VolumePoolVolumeStateCold, rw(ipA))
+			},
+			nodeID: "node-a",
+		},
+		{
+			// Likewise, the API requires the IP ACLs to be empty to make a
+			// volume WARM.
+			name: "WARM volume",
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.getVolume = volumeWithIpAcls(file.VolumePoolVolumeStateWarm, rw(ipA))
 			},
 			nodeID: "node-a",
 		},

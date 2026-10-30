@@ -187,10 +187,11 @@ func (s *controllerServer) unpublishVolumePoolVolume(ctx context.Context, req *c
 		}
 		return volumePoolError(err)
 	}
-	if vol.State == file.VolumePoolVolumeStateCold {
-		// A COLD volume is exported to no clients: the API removes its IP
-		// ACLs before freezing it, and doesn't let them change until it is
-		// unfrozen.
+	if vol.State == file.VolumePoolVolumeStateCold || vol.State == file.VolumePoolVolumeStateWarm {
+		// A COLD or WARM volume is exported to no clients: the API requires
+		// its IP ACLs to be empty before it freezes the volume or makes it
+		// WARM, and doesn't let them change until the volume is HOT again.
+		klog.V(4).Infof("Volume Pool volume %q is %s, so it is not published to node %q", name, vol.State, nodeID)
 		return nil
 	}
 
