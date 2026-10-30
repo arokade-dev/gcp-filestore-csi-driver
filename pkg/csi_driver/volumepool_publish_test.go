@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
@@ -598,6 +600,17 @@ func volumeWithIpAcls(state string, acls ...file.VolumePoolNfsExportOptions) fun
 	}
 }
 
+// ipAclUpdatesDisabled is an updateIpAcls override that fails like the API
+// does for a project that isn't allowed to update volume IP ACLs.
+func ipAclUpdatesDisabled(context.Context, string, []file.VolumePoolNfsExportOptions) (*file.PoolVolume, error) {
+	const msg = "Volume Freeze and Thaw APIs are not enabled"
+	return nil, &googleapi.Error{
+		Code:    http.StatusBadRequest,
+		Message: msg,
+		Body:    fmt.Sprintf(`{"error": {"code": 400, "message": %q, "status": "FAILED_PRECONDITION"}}`, msg),
+	}
+}
+
 const (
 	ipA = "10.128.0.11"
 	ipB = "10.128.0.12"
@@ -942,6 +955,17 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			wantUpdates: 1,
 		},
 		{
+			// Retrying doesn't help until the project is allowed to update
+			// volume IP ACLs.
+			name: "IP ACL updates not enabled for the project",
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.updateIpAcls = ipAclUpdatesDisabled
+			},
+			req:         publishRequest("node-a", snw),
+			wantCode:    codes.FailedPrecondition,
+			wantUpdates: 1,
+		},
+		{
 			name: "volume deleted before its IP ACLs are updated",
 			setup: func(_ *controllerServer, fs *publishTestService) {
 				fs.updateIpAcls = func(context.Context, string, []file.VolumePoolNfsExportOptions) (*file.PoolVolume, error) {
@@ -1271,6 +1295,16 @@ func TestControllerUnpublishVolume_VolumePool(t *testing.T) {
 			},
 			nodeID:      "node-a",
 			wantCode:    codes.Aborted,
+			wantUpdates: 1,
+		},
+		{
+			name:        "IP ACL updates not enabled for the project",
+			initialAcls: []file.VolumePoolNfsExportOptions{rw(ipA)},
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.updateIpAcls = ipAclUpdatesDisabled
+			},
+			nodeID:      "node-a",
+			wantCode:    codes.FailedPrecondition,
 			wantUpdates: 1,
 		},
 		{

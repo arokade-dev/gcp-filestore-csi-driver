@@ -29,7 +29,7 @@ This overlay enables the **GCP Filestore CSI Driver** to integrate natively with
 
 4. **IAM Permissions Requirement**: The user or automation executing the deployment script *must* have the permissions to create Service Accounts and assign IAM bindings in the target GCP Project (e.g. `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin`, or broadly `roles/owner`).
 
-5. **Volume IP ACL Updates**: The driver publishes a volume to a node by updating the volume's IP ACLs (see [Publishing Volumes to Nodes](#-publishing-volumes-to-nodes)), so your GCP Project must also be allowlisted for volume IP ACL updates. Without it, publishing fails with `Aborted` and the message `Volume Freeze and Thaw APIs are not enabled`.
+5. **Volume IP ACL Updates**: The driver publishes a volume to a node by updating the volume's IP ACLs (see [Publishing Volumes to Nodes](#-publishing-volumes-to-nodes)), so your GCP Project must also be allowlisted for volume IP ACL updates. Without it, publishing fails with `FailedPrecondition` and the message `Volume Freeze and Thaw APIs are not enabled`.
 
 This integration utilizes **GKE Workload Identity** to securely authenticate against Google Cloud Filestore APIs without storing static JSON credentials in Kubernetes secrets.
 

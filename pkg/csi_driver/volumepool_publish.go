@@ -301,14 +301,27 @@ func (s *controllerServer) updateVolumePoolIpAcls(ctx context.Context, name stri
 	}
 	err = volumePoolError(err)
 	if status.Code(err) == codes.FailedPrecondition {
+		msg := status.Convert(err).Message()
+		if isVolumePoolIpAclUpdateDisabled(msg) {
+			// Retrying doesn't help until the project is allowed to update
+			// volume IP ACLs.
+			return status.Errorf(codes.FailedPrecondition, "cannot update the IP ACLs of volume %q: %s; the project must be allowlisted for volume IP ACL updates", name, msg)
+		}
 		// The volume was HOT when it was read, so the API most likely refused
 		// the update because another operation, such as a backup, holds the
-		// volume. Return Aborted so that the caller retries. The API returns
-		// the same code when IP ACL updates are not enabled; its message,
-		// which is kept, tells the two apart.
-		return status.Errorf(codes.Aborted, "cannot update the IP ACLs of volume %q now: %s", name, status.Convert(err).Message())
+		// volume. Return Aborted so that the caller retries.
+		return status.Errorf(codes.Aborted, "cannot update the IP ACLs of volume %q now: %s", name, msg)
 	}
 	return err
+}
+
+// isVolumePoolIpAclUpdateDisabled reports whether msg, the message of a
+// FAILED_PRECONDITION that the API returned for an update of a volume's IP
+// ACLs, says that the project may not update them: the API then answers
+// "Volume Freeze and Thaw APIs are not enabled". Only the message tells this
+// apart from a volume that another operation holds.
+func isVolumePoolIpAclUpdateDisabled(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "not enabled")
 }
 
 // volumePoolNodeIpAcl returns the IP ACL entry that lets the node with IP
