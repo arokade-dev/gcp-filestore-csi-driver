@@ -17,10 +17,15 @@ limitations under the License.
 package driver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/go-cmp/cmp"
@@ -31,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 	cloud "sigs.k8s.io/gcp-filestore-csi-driver/pkg/cloud_provider"
 	"sigs.k8s.io/gcp-filestore-csi-driver/pkg/cloud_provider/file"
 )
@@ -163,6 +169,136 @@ func TestStripVolumePoolNode(t *testing.T) {
 	if diff := cmp.Diff(tombstone, got); diff != "" {
 		t.Errorf("stripVolumePoolNode(tombstone) diff (-want +got):\n%s", diff)
 	}
+}
+
+const (
+	logNodeCacheSynced    = "Volume Pool volumes synced after"
+	logNodeCacheNotSynced = "Volume Pool volumes has not synced after"
+)
+
+func TestWaitForVolumePoolNodeCache(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// syncAfter is how many times synced reports false before it
+		// reports true; -1 means it never does.
+		syncAfter  int
+		warnAfter  time.Duration
+		stopAfter  time.Duration
+		wantSynced bool
+		wantLogs   []string
+		noLogs     []string
+	}{
+		{
+			name:       "already synced",
+			warnAfter:  time.Hour,
+			wantSynced: true,
+			wantLogs:   []string{logNodeCacheSynced},
+			noLogs:     []string{logNodeCacheNotSynced},
+		},
+		{
+			name:       "synced soon",
+			syncAfter:  3,
+			warnAfter:  time.Hour,
+			wantSynced: true,
+			wantLogs:   []string{logNodeCacheSynced},
+			noLogs:     []string{logNodeCacheNotSynced},
+		},
+		{
+			name:       "synced after the warning",
+			syncAfter:  3,
+			warnAfter:  10 * time.Millisecond,
+			wantSynced: true,
+			wantLogs:   []string{logNodeCacheNotSynced + " 10ms", logNodeCacheSynced},
+		},
+		{
+			name:      "never synced",
+			syncAfter: -1,
+			warnAfter: 10 * time.Millisecond,
+			stopAfter: 300 * time.Millisecond,
+			wantLogs:  []string{logNodeCacheNotSynced + " 10ms"},
+			noLogs:    []string{logNodeCacheSynced},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureKlog(t)
+			calls := 0
+			synced := func() bool {
+				calls++
+				return tc.syncAfter >= 0 && calls > tc.syncAfter
+			}
+			stopCh := make(chan struct{})
+			if tc.stopAfter > 0 {
+				timer := time.AfterFunc(tc.stopAfter, func() { close(stopCh) })
+				defer timer.Stop()
+			}
+
+			if got := waitForVolumePoolNodeCache(stopCh, synced, tc.warnAfter); got != tc.wantSynced {
+				t.Errorf("waitForVolumePoolNodeCache() = %v, want %v", got, tc.wantSynced)
+			}
+			got := logs()
+			for _, want := range tc.wantLogs {
+				if !strings.Contains(got, want) {
+					t.Errorf("logs don't contain %q:\n%s", want, got)
+				}
+			}
+			for _, unwanted := range tc.noLogs {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("logs contain %q:\n%s", unwanted, got)
+				}
+			}
+		})
+	}
+}
+
+func TestStartVolumePoolNodes_LogsCacheSync(t *testing.T) {
+	logs := captureKlog(t)
+	cs := &controllerServer{config: &controllerServerConfig{volumePoolNodes: newVolumePoolNodes(fake.NewSimpleClientset())}}
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	cs.startVolumePoolNodes(stopCh)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(logs(), logNodeCacheSynced) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no log says that the node cache synced:\n%s", logs())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// captureKlog sends klog's output to a buffer until the test ends, and returns
+// a function that returns what was logged so far.
+func captureKlog(t *testing.T) func() string {
+	t.Helper()
+	buf := &syncBuffer{}
+	klog.SetOutput(buf)
+	klog.LogToStderr(false)
+	t.Cleanup(func() {
+		klog.LogToStderr(true)
+		klog.SetOutput(os.Stderr)
+	})
+	return func() string {
+		klog.Flush()
+		return buf.String()
+	}
+}
+
+// syncBuffer is a bytes.Buffer that is safe for concurrent use.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestNewGCFSDriver_VolumePoolNodes(t *testing.T) {

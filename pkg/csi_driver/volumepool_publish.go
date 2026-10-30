@@ -512,11 +512,49 @@ func newVolumePoolNodes(kubeClient kubernetes.Interface) *volumePoolNodes {
 }
 
 // startVolumePoolNodes starts the Node informer that publishing volume pool
-// volumes relies on, if there is one.
+// volumes relies on, if there is one, and logs when its cache syncs.
 func (s *controllerServer) startVolumePoolNodes(stopCh <-chan struct{}) {
-	if n := s.config.volumePoolNodes; n != nil && n.informers != nil {
-		n.informers.Start(stopCh)
+	n := s.config.volumePoolNodes
+	if n == nil || n.informers == nil {
+		return
 	}
+	n.informers.Start(stopCh)
+	go waitForVolumePoolNodeCache(stopCh, n.informers.Core().V1().Nodes().Informer().HasSynced, volumePoolNodeCacheWarnAfter)
+}
+
+const (
+	// volumePoolNodeCacheWarnAfter is how long the node cache may take to
+	// sync before the controller warns about it. Listing nodes takes
+	// seconds at most, so a cache that hasn't synced by then most likely
+	// can't list them.
+	volumePoolNodeCacheWarnAfter = time.Minute
+	// volumePoolNodeCachePollPeriod is how often the controller checks
+	// whether the node cache has synced.
+	volumePoolNodeCachePollPeriod = 100 * time.Millisecond
+)
+
+// waitForVolumePoolNodeCache waits until synced reports that the node cache
+// has synced, or until stopCh is closed, and reports whether the cache synced.
+// It logs when the cache syncs, and warns if it hasn't after warnAfter: if the
+// controller can't list nodes, the only other trace is client-go's errors
+// about *v1.Node.
+func waitForVolumePoolNodeCache(stopCh <-chan struct{}, synced cache.InformerSynced, warnAfter time.Duration) bool {
+	start := time.Now()
+	warn := time.NewTimer(warnAfter)
+	defer warn.Stop()
+	poll := time.NewTicker(volumePoolNodeCachePollPeriod)
+	defer poll.Stop()
+	for !synced() {
+		select {
+		case <-stopCh:
+			return false
+		case <-warn.C:
+			klog.Warningf("The node cache for publishing Volume Pool volumes has not synced after %v. Until it does, ControllerPublishVolume and ControllerUnpublishVolume of Volume Pool volumes return Unavailable. Check that the controller's service account can list and watch nodes, and look for errors about *v1.Node in these logs.", warnAfter)
+		case <-poll.C:
+		}
+	}
+	klog.Infof("The node cache for publishing Volume Pool volumes synced after %v", time.Since(start).Round(time.Millisecond))
+	return true
 }
 
 // nodeIPResolver looks up the IP address that a Kubernetes node mounts NFS
