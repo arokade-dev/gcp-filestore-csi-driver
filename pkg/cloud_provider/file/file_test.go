@@ -1703,6 +1703,10 @@ func TestVolumePoolUnexpectedSuccessStatus(t *testing.T) {
 			_, err := m.CreateVolumePoolVolumeFromSource(ctx, pool, "vol-1", "projects/test-project/locations/us-central1/backups/snap-1")
 			return err
 		}},
+		{name: "update IP ACLs", call: func(ctx context.Context, m *gcfsServiceManager) error {
+			_, err := m.UpdateVolumePoolVolumeIpAcls(ctx, name, nil)
+			return err
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

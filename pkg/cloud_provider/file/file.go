@@ -1923,7 +1923,7 @@ func (manager *gcfsServiceManager) UpdateVolumePoolVolumeIpAcls(ctx context.Cont
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, volumePoolAPIError(googleapi.CheckResponse(resp), fmt.Sprintf("update IP ACLs of volume %q", name))
+		return nil, volumePoolResponseError(resp, fmt.Sprintf("update IP ACLs of volume %q", name))
 	}
 
 	var vol VolumePoolVolume
