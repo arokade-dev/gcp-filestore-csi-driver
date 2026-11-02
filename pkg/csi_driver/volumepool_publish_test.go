@@ -996,6 +996,25 @@ func TestControllerPublishVolume_VolumePool(t *testing.T) {
 			wantCode: codes.FailedPrecondition,
 		},
 		{
+			name: "HOT volume without a mount point",
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.getVolume = func(_ context.Context, name string) (*file.PoolVolume, error) {
+					return &file.PoolVolume{Name: name, State: file.VolumePoolVolumeStateHot}, nil
+				}
+			},
+			req:      publishRequest("node-a", snw),
+			wantCode: codes.Aborted,
+		},
+		{
+			// For example, the volume's instance is being recovered.
+			name: "unspecified-state volume without a mount point",
+			setup: func(_ *controllerServer, fs *publishTestService) {
+				fs.getVolume = volumeInState(file.VolumePoolVolumeStateUnspecified)
+			},
+			req:      publishRequest("node-a", snw),
+			wantCode: codes.Aborted,
+		},
+		{
 			name: "volume busy with another operation",
 			setup: func(_ *controllerServer, fs *publishTestService) {
 				fs.updateIpAcls = func(context.Context, string, []file.VolumePoolNfsExportOptions) (*file.PoolVolume, error) {
