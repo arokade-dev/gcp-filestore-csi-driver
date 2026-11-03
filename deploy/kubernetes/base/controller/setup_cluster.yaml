@@ -66,6 +66,13 @@ rules:
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotcontents"]
     verbs: ["get", "list"]
+  # csi-provisioner watches VolumeAttachments when the driver has the
+  # PUBLISH_UNPUBLISH_VOLUME controller capability, as it does with
+  # --feature-volume-pools=true, so that it doesn't delete a volume that is
+  # still attached. Without these permissions, it never starts provisioning.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1

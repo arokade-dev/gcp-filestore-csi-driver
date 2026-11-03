@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"slices"
@@ -36,10 +37,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilcache "k8s.io/apimachinery/pkg/util/cache"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
@@ -1536,6 +1539,48 @@ func TestControllerCapabilities_PublishUnpublish(t *testing.T) {
 			}
 		})
 	}
+}
+
+// With Volume Pools on, the controller advertises PUBLISH_UNPUBLISH_VOLUME, and
+// csi-provisioner then watches VolumeAttachments, so that it doesn't delete a
+// volume that is still attached. If it may not list them, its informer never
+// syncs and it provisions nothing, so the ClusterRole that the deploy manifests
+// give it must allow get, list and watch on them.
+func TestProvisionerRoleAllowsVolumeAttachments(t *testing.T) {
+	const manifest = "../../deploy/kubernetes/base/controller/setup_cluster.yaml"
+	const roleName = "gcp-filestore-csi-provisioner-role"
+
+	driver := initTestControllerDriver(t, &FeatureVolumePools{Enabled: true})
+	if err := driver.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME); err != nil {
+		t.Fatalf("PUBLISH_UNPUBLISH_VOLUME is not advertised with Volume Pools on: %v", err)
+	}
+
+	f, err := os.Open(manifest)
+	if err != nil {
+		t.Fatalf("failed to open %s: %v", manifest, err)
+	}
+	defer f.Close()
+	decoder := utilyaml.NewYAMLOrJSONDecoder(f, 4096)
+	for {
+		var role rbacv1.ClusterRole
+		if err := decoder.Decode(&role); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("failed to decode %s: %v", manifest, err)
+		}
+		if role.Kind != "ClusterRole" || role.Name != roleName {
+			continue
+		}
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.APIGroups, "storage.k8s.io") && slices.Contains(rule.Resources, "volumeattachments") &&
+				slices.Contains(rule.Verbs, "get") && slices.Contains(rule.Verbs, "list") && slices.Contains(rule.Verbs, "watch") {
+				return
+			}
+		}
+		t.Fatalf("ClusterRole %s in %s doesn't allow get, list and watch on volumeattachments in storage.k8s.io", roleName, manifest)
+	}
+	t.Fatalf("ClusterRole %s not found in %s", roleName, manifest)
 }
 
 // Only removing another node's entry counts as an eviction, which is logged as
