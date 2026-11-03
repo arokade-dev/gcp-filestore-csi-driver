@@ -1703,6 +1703,10 @@ func TestVolumePoolUnexpectedSuccessStatus(t *testing.T) {
 			_, err := m.CreateVolumePoolVolumeFromSource(ctx, pool, "vol-1", "projects/test-project/locations/us-central1/backups/snap-1")
 			return err
 		}},
+		{name: "update IP ACLs", call: func(ctx context.Context, m *gcfsServiceManager) error {
+			_, err := m.UpdateVolumePoolVolumeIpAcls(ctx, name, nil)
+			return err
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1724,6 +1728,93 @@ func TestVolumePoolUnexpectedSuccessStatus(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), "unexpected HTTP status 202") || strings.Contains(err.Error(), "%!") {
 				t.Errorf("error = %v, want a message with %q and no formatting error", err, "unexpected HTTP status 202")
+			}
+		})
+	}
+}
+
+func TestUpdateVolumePoolVolumeIpAcls(t *testing.T) {
+	name := "projects/test-project/locations/us-central1/volumePools/test-pool/volumes/vol-123"
+	nodeACL := VolumePoolNfsExportOptions{
+		IpRanges:   []string{"10.128.0.11"},
+		AccessMode: VolumePoolAccessModeReadWrite,
+		SquashMode: VolumePoolSquashModeNoRoot,
+	}
+
+	tests := []struct {
+		name         string
+		acls         []VolumePoolNfsExportOptions
+		responseCode int
+		responseBody string
+		wantBodyACLs string // the ipAcls JSON the request must carry
+		want         *PoolVolume
+		wantCode     codes.Code
+	}{
+		{
+			name:         "sets the IP ACLs",
+			acls:         []VolumePoolNfsExportOptions{nodeACL},
+			responseCode: http.StatusOK,
+			responseBody: fmt.Sprintf(`{"name": %q, "mountPoint": {"ipAddress": "10.0.0.2", "mountName": "vol_123"}, "state": "HOT", "ipAcls": [{"ipRanges": ["10.128.0.11"], "accessMode": "READ_WRITE", "squashMode": "NO_ROOT_SQUASH"}]}`, name),
+			wantBodyACLs: `[{"ipRanges":["10.128.0.11"],"accessMode":"READ_WRITE","squashMode":"NO_ROOT_SQUASH"}]`,
+			want:         &PoolVolume{Name: name, IpAddress: "10.0.0.2", MountName: "vol_123", State: VolumePoolVolumeStateHot, IpAcls: []VolumePoolNfsExportOptions{nodeACL}},
+		},
+		{
+			name:         "nil ACLs are sent as an empty list, which revokes all access",
+			acls:         nil,
+			responseCode: http.StatusOK,
+			responseBody: fmt.Sprintf(`{"name": %q, "mountPoint": {"ipAddress": "10.0.0.2", "mountName": "vol_123"}, "state": "HOT"}`, name),
+			wantBodyACLs: `[]`,
+			want:         &PoolVolume{Name: name, IpAddress: "10.0.0.2", MountName: "vol_123", State: VolumePoolVolumeStateHot},
+		},
+		{
+			name:         "volume is busy",
+			acls:         []VolumePoolNfsExportOptions{nodeACL},
+			responseCode: http.StatusBadRequest,
+			responseBody: apiErrorBody(http.StatusBadRequest, "FAILED_PRECONDITION", "another operation is in progress"),
+			wantBodyACLs: `[{"ipRanges":["10.128.0.11"],"accessMode":"READ_WRITE","squashMode":"NO_ROOT_SQUASH"}]`,
+			wantCode:     codes.FailedPrecondition,
+		},
+		{
+			name:         "volume does not exist",
+			acls:         []VolumePoolNfsExportOptions{nodeACL},
+			responseCode: http.StatusNotFound,
+			responseBody: apiErrorBody(http.StatusNotFound, "NOT_FOUND", "volume not found"),
+			wantBodyACLs: `[{"ipRanges":["10.128.0.11"],"accessMode":"READ_WRITE","squashMode":"NO_ROOT_SQUASH"}]`,
+			wantCode:     codes.NotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPatch || r.URL.Path != "/v1beta1/"+name {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				if got := r.URL.Query().Get("updateMask"); got != "ipAcls" {
+					t.Errorf("updateMask = %q, want ipAcls", got)
+				}
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("failed to decode request body: %v", err)
+				}
+				if got := string(body["ipAcls"]); got != tc.wantBodyACLs {
+					t.Errorf("request ipAcls = %s, want %s", got, tc.wantBodyACLs)
+				}
+				if got := string(body["name"]); got != fmt.Sprintf("%q", name) {
+					t.Errorf("request name = %s, want %q", got, name)
+				}
+				w.WriteHeader(tc.responseCode)
+				fmt.Fprint(w, tc.responseBody)
+			}))
+			defer server.Close()
+			manager := newVolumePoolTestManager(t, server)
+
+			got, err := manager.UpdateVolumePoolVolumeIpAcls(context.Background(), name, tc.acls)
+			if code := status.Code(VolumePoolStatusError(err)); code != tc.wantCode {
+				t.Fatalf("UpdateVolumePoolVolumeIpAcls() error = %v (code %v), want code %v", err, code, tc.wantCode)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("UpdateVolumePoolVolumeIpAcls() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -1766,5 +1857,119 @@ func TestWaitForVolumePoolOp_TimeoutDuringPoll(t *testing.T) {
 	err := manager.waitForVolumePoolOp(context.Background(), &filev1beta1.Operation{Name: opName})
 	if code := status.Code(err); code != codes.DeadlineExceeded || !strings.Contains(err.Error(), "still running after") {
 		t.Errorf("waitForVolumePoolOp() error = %v (code %v), want code %v saying that the operation is still running", err, code, codes.DeadlineExceeded)
+	}
+}
+
+func TestGetVolumePoolVolume_IpAcls(t *testing.T) {
+	name := "projects/test-project/locations/us-central1/volumePools/test-pool/volumes/vol-123"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"name": %q, "state": "HOT", "mountPoint": {"ipAddress": "10.0.0.2", "mountName": "vol_123"},
+			"ipAcls": [{"ipRanges": ["10.128.0.11/32"], "accessMode": "READ_ONLY", "squashMode": "ROOT_SQUASH", "anonUid": "1000", "anonGid": "2000", "securityFlavors": ["AUTH_SYS"]}]}`, name)
+	}))
+	defer server.Close()
+	manager := newVolumePoolTestManager(t, server)
+
+	got, err := manager.GetVolumePoolVolume(context.Background(), name)
+	if err != nil {
+		t.Fatalf("GetVolumePoolVolume() error = %v", err)
+	}
+	want := []VolumePoolNfsExportOptions{{
+		IpRanges:        []string{"10.128.0.11/32"},
+		AccessMode:      VolumePoolAccessModeReadOnly,
+		SquashMode:      "ROOT_SQUASH",
+		AnonUid:         1000,
+		AnonGid:         2000,
+		SecurityFlavors: []string{"AUTH_SYS"},
+	}}
+	if diff := cmp.Diff(want, got.IpAcls); diff != "" {
+		t.Errorf("IpAcls mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// The fake checks IP ACLs like the API does, so that tests can't put a volume
+// in a state that the API would refuse.
+func TestFakeUpdateVolumePoolVolumeIpAcls(t *testing.T) {
+	const pool = "projects/test-project/locations/us-central1/volumePools/test-pool"
+	name := pool + "/volumes/vol-1"
+	entry := func(ipRanges ...string) VolumePoolNfsExportOptions {
+		return VolumePoolNfsExportOptions{
+			IpRanges:        ipRanges,
+			AccessMode:      VolumePoolAccessModeReadWrite,
+			SquashMode:      VolumePoolSquashModeNoRoot,
+			SecurityFlavors: []string{VolumePoolSecurityFlavorAuthSys},
+		}
+	}
+	withAnonIDs := func(acl VolumePoolNfsExportOptions, squashMode string) VolumePoolNfsExportOptions {
+		acl.SquashMode = squashMode
+		acl.AnonUid, acl.AnonGid = 1000, 1001
+		return acl
+	}
+	var tooMany []string
+	for i := 1; i <= 65; i++ {
+		tooMany = append(tooMany, fmt.Sprintf("10.0.0.%d", i))
+	}
+
+	for _, tc := range []struct {
+		name string
+		// volume is the volume to update, vol-1 if empty, and state is
+		// vol-1's state, HOT if empty.
+		volume   string
+		state    string
+		acls     []VolumePoolNfsExportOptions
+		wantCode codes.Code
+	}{
+		{name: "nodes and a wider range", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry("10.128.0.12/32"), entry("192.168.0.0/16")}},
+		{name: "no entries", acls: nil},
+		{name: "ranges that only overlap", acls: []VolumePoolNfsExportOptions{entry("10.0.0.0/8"), entry("10.0.0.0/16")}},
+		{name: "anon IDs with ROOT_SQUASH", acls: []VolumePoolNfsExportOptions{withAnonIDs(entry("10.0.0.0/8"), "ROOT_SQUASH")}},
+		{name: "an address twice", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry("10.128.0.11")}, wantCode: codes.InvalidArgument},
+		{name: "an address and its /32 range", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry("10.128.0.11/32")}, wantCode: codes.InvalidArgument},
+		{name: "a range written two ways", acls: []VolumePoolNfsExportOptions{entry("10.0.0.0/8", "10.0.0.1/8")}, wantCode: codes.InvalidArgument},
+		{name: "IPv6 address", acls: []VolumePoolNfsExportOptions{entry("fd00::1")}, wantCode: codes.InvalidArgument},
+		{name: "not an address", acls: []VolumePoolNfsExportOptions{entry("node-a")}, wantCode: codes.InvalidArgument},
+		{name: "65 ranges", acls: []VolumePoolNfsExportOptions{entry(tooMany...)}, wantCode: codes.InvalidArgument},
+		{name: "entry without IP ranges", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11"), entry()}, wantCode: codes.InvalidArgument},
+		{name: "anon IDs without ROOT_SQUASH", acls: []VolumePoolNfsExportOptions{withAnonIDs(entry("10.0.0.0/8"), VolumePoolSquashModeNoRoot)}, wantCode: codes.InvalidArgument},
+		{name: "WARM volume", state: VolumePoolVolumeStateWarm, acls: []VolumePoolNfsExportOptions{entry("10.128.0.11")}, wantCode: codes.FailedPrecondition},
+		{name: "volume not found", volume: pool + "/volumes/missing", acls: []VolumePoolNfsExportOptions{entry("10.128.0.11")}, wantCode: codes.NotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, err := NewFakeService()
+			if err != nil {
+				t.Fatalf("NewFakeService() error = %v", err)
+			}
+			manager := s.(*fakeServiceManager)
+			if _, err := manager.CreateVolumePoolVolume(ctx, pool, "vol-1"); err != nil {
+				t.Fatalf("CreateVolumePoolVolume() error = %v", err)
+			}
+			if tc.state != "" {
+				manager.allocatedVolumes[name].State = tc.state
+			}
+			before := copyVolumePoolAcls(manager.allocatedVolumes[name].IpAcls)
+			volume := tc.volume
+			if volume == "" {
+				volume = name
+			}
+
+			got, err := manager.UpdateVolumePoolVolumeIpAcls(ctx, volume, tc.acls)
+			if code := status.Code(err); code != tc.wantCode {
+				t.Fatalf("UpdateVolumePoolVolumeIpAcls() error = %v (code %v), want code %v", err, code, tc.wantCode)
+			}
+			stored := manager.allocatedVolumes[name].IpAcls
+			if err != nil {
+				// A refused update leaves the IP ACLs as they were.
+				if diff := cmp.Diff(before, stored); diff != "" {
+					t.Errorf("IP ACLs changed although the update was refused (-before +after):\n%s", diff)
+				}
+				return
+			}
+			if diff := cmp.Diff(tc.acls, got.IpAcls); diff != "" {
+				t.Errorf("returned IP ACLs mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.acls, stored); diff != "" {
+				t.Errorf("stored IP ACLs mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

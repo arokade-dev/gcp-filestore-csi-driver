@@ -86,6 +86,8 @@ type PoolVolume struct {
 	// State is the volume's lifecycle state, such as VolumePoolVolumeStateHot.
 	// It is empty if the API did not report a state.
 	State string
+	// IpAcls are the volume's IP ACLs: the clients that its share exports to.
+	IpAcls []VolumePoolNfsExportOptions
 }
 
 // Lifecycle states of a volume pool volume, as reported by the Filestore API.
@@ -107,16 +109,18 @@ type VolumePoolMountPoint struct {
 }
 
 type VolumePoolVolume struct {
-	Name        string                `json:"name,omitempty"`
-	Description string                `json:"description,omitempty"`
-	MountPoint  *VolumePoolMountPoint `json:"mountPoint,omitempty"`
-	State       string                `json:"state,omitempty"`
+	Name        string                       `json:"name,omitempty"`
+	Description string                       `json:"description,omitempty"`
+	MountPoint  *VolumePoolMountPoint        `json:"mountPoint,omitempty"`
+	State       string                       `json:"state,omitempty"`
+	IpAcls      []VolumePoolNfsExportOptions `json:"ipAcls,omitempty"`
 }
 
 func (v *VolumePoolVolume) toPoolVolume() *PoolVolume {
 	vol := &PoolVolume{
-		Name:  v.Name,
-		State: v.State,
+		Name:   v.Name,
+		State:  v.State,
+		IpAcls: v.IpAcls,
 	}
 	if v.MountPoint != nil {
 		vol.IpAddress = v.MountPoint.IpAddress
@@ -252,6 +256,7 @@ type Service interface {
 	DeleteVolumePoolVolume(ctx context.Context, name string) error
 	GetVolumePoolVolume(ctx context.Context, name string) (*PoolVolume, error)
 	CreateVolumePoolVolumeFromSource(ctx context.Context, parentPool, volumeID, backupName string) (*PoolVolume, error)
+	UpdateVolumePoolVolumeIpAcls(ctx context.Context, name string, acls []VolumePoolNfsExportOptions) (*PoolVolume, error)
 }
 
 type gcfsServiceManager struct {
@@ -1868,4 +1873,62 @@ func canonicalCode(apiErr *googleapi.Error) (codes.Code, bool) {
 		return codes.Unknown, false
 	}
 	return code, true
+}
+
+// VolumePoolNfsExportOptions is one IP ACL rule of a volume pool volume: the
+// NFS export options for the clients in IpRanges. It mirrors every field of the
+// API's NfsExportOptions, even those that publishing never sets, such as the
+// anon IDs and the network: an update replaces the whole list of rules, so the
+// rules that publishing keeps, such as those set by hand, must be written back
+// exactly as they were read.
+type VolumePoolNfsExportOptions struct {
+	IpRanges        []string `json:"ipRanges,omitempty"`
+	AccessMode      string   `json:"accessMode,omitempty"`
+	SquashMode      string   `json:"squashMode,omitempty"`
+	AnonUid         int64    `json:"anonUid,omitempty,string"`
+	AnonGid         int64    `json:"anonGid,omitempty,string"`
+	SecurityFlavors []string `json:"securityFlavors,omitempty"`
+	Network         string   `json:"network,omitempty"`
+}
+
+// Values of VolumePoolNfsExportOptions.AccessMode, SquashMode and
+// SecurityFlavors.
+const (
+	VolumePoolAccessModeReadWrite   = "READ_WRITE"
+	VolumePoolAccessModeReadOnly    = "READ_ONLY"
+	VolumePoolSquashModeNoRoot      = "NO_ROOT_SQUASH"
+	VolumePoolSecurityFlavorAuthSys = "AUTH_SYS"
+)
+
+// volumePoolIpAclsUpdate is the body of a request that replaces a volume's IP
+// ACLs. IpAcls has no omitempty: an empty list must be sent to revoke all access.
+type volumePoolIpAclsUpdate struct {
+	Name   string                       `json:"name"`
+	IpAcls []VolumePoolNfsExportOptions `json:"ipAcls"`
+}
+
+// UpdateVolumePoolVolumeIpAcls replaces the IP ACLs of the volume pool volume
+// name with acls and returns the updated volume. An empty acls revokes all
+// client access to the volume. The call is synchronous: when it returns, the
+// volume's share exports to exactly the clients in acls.
+func (manager *gcfsServiceManager) UpdateVolumePoolVolumeIpAcls(ctx context.Context, name string, acls []VolumePoolNfsExportOptions) (*PoolVolume, error) {
+	if acls == nil {
+		acls = []VolumePoolNfsExportOptions{}
+	}
+	reqBody := &volumePoolIpAclsUpdate{Name: name, IpAcls: acls}
+	resp, err := manager.executeRESTRequest(ctx, http.MethodPatch, name+"?updateMask=ipAcls", reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("update IP ACLs of volume %q: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, volumePoolResponseError(resp, fmt.Sprintf("update IP ACLs of volume %q", name))
+	}
+
+	var vol VolumePoolVolume
+	if err := json.NewDecoder(resp.Body).Decode(&vol); err != nil {
+		return nil, fmt.Errorf("failed to decode volume %q: %w", name, err)
+	}
+	return vol.toPoolVolume(), nil
 }

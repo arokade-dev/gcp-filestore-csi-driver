@@ -29,6 +29,8 @@ This overlay enables the **GCP Filestore CSI Driver** to integrate natively with
 
 4. **IAM Permissions Requirement**: The user or automation executing the deployment script *must* have the permissions to create Service Accounts and assign IAM bindings in the target GCP Project (e.g. `roles/iam.serviceAccountAdmin` and `roles/resourcemanager.projectIamAdmin`, or broadly `roles/owner`).
 
+5. **Volume IP ACL Updates**: The driver publishes a volume to a node by updating the volume's IP ACLs (see [Publishing Volumes to Nodes](#-publishing-volumes-to-nodes)), so your GCP Project must also be allowlisted for volume IP ACL updates. Without it, publishing fails with `FailedPrecondition` and the message `Volume Freeze and Thaw APIs are not enabled`.
+
 This integration utilizes **GKE Workload Identity** to securely authenticate against Google Cloud Filestore APIs without storing static JSON credentials in Kubernetes secrets.
 
 > [!NOTE]
@@ -83,3 +85,17 @@ The included `deploy.sh` script completely automates the installation, validates
    ```
 
 *(Note: If you skip `deploy.sh`, you will need to manually render and apply `examples/kubernetes/substrate/storageclass.yaml.tmpl` to provision micro-volumes from a VolumePool).*
+
+---
+
+## 🔐 Publishing Volumes to Nodes
+
+With `--feature-volume-pools=true`, the controller advertises the `PUBLISH_UNPUBLISH_VOLUME` capability, and Substrate publishes a volume to the node that mounts it:
+
+- `ControllerPublishVolume` restricts the volume's IP ACLs to the node's internal IPv4 address. A new volume is exported to all private IP ranges until it is first published. Anything that mounts the volume without being published loses access when the volume is first published, for example a VM outside the cluster, or a Kubernetes pod: Kubernetes never publishes these volumes, since the CSIDriver has `attachRequired: false`.
+- `ControllerUnpublishVolume` removes the node's address. A volume that is published to no node is exported to no client. For a node that is gone, or that GKE created again with another address, as when it repairs a node, it also removes the address that the node had when the controller saw it deleted, in the last day, unless another node has that address now.
+- With a single-node access mode, such as `SINGLE_NODE_WRITER`, a volume is published to one node at a time. As the CSI spec requires, publishing a volume that is published to another node fails with `FAILED_PRECONDITION`, naming that node: unpublish the volume from it first, as Substrate does when it suspends an actor or reverts a crashed one. An entry for an address that no node has anymore, which a node that is gone can leave behind, is replaced instead: the controller then logs a warning and increments the `filestorecsi_volume_pool_publish_eviction_count` metric. The controller exports metrics only when it runs with both `--http-endpoint` (for example `--http-endpoint=:22024`, served at `--metrics-path`, `/metrics` by default) and the `GKE_FILESTORECSI_VERSION` environment variable set. This overlay sets neither, so the warning in the controller's logs is the only sign of a replacement.
+- The controller finds a node's address in the cache of a Node informer, and gets the node from the API server when the cache can't answer: before it has synced, or for a node added since. It uses the `get`, `list` and `watch` permissions on nodes that its ClusterRole already grants.
+- Because the controller advertises `PUBLISH_UNPUBLISH_VOLUME`, csi-provisioner watches VolumeAttachments, so that it doesn't delete a volume that is still attached. The base ClusterRole grants it `get`, `list` and `watch` on `volumeattachments`; without them, csi-provisioner never starts, and no PVC is provisioned.
+- The CSIDriver object keeps `attachRequired: false`, so Kubernetes itself never calls these RPCs.
+- Publishing reads a volume's IP ACLs and writes them back whole. The API has no etag, and the lock that serializes changes to a volume's IP ACLs is held per controller process, so two calls for the same volume on different controller replicas could lose one of the two changes. Substrate never makes such calls for single-node volumes, so the controller can run several replicas: each volume belongs to one actor, whose workflows run under a lease. Volumes shared by several actors, with multi-node access modes, don't have that guarantee, so don't share volumes between actors until calls for one volume are serialized across replicas.

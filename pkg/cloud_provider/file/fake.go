@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 
 	"github.com/google/uuid"
 	filev1beta1 "google.golang.org/api/file/v1beta1"
@@ -538,6 +539,8 @@ func (manager *fakeBlockingServiceManager) IsOpDone(*filev1beta1multishare.Opera
 	return !val.ReportRunning, nil
 }
 
+// CreateVolumePoolVolume creates a HOT volume with the default IP ACLs, as the
+// API does for a request that sets no IP ACLs.
 func (manager *fakeServiceManager) CreateVolumePoolVolume(ctx context.Context, parentPool string, volumeID string) (*PoolVolume, error) {
 	if manager.allocatedVolumes == nil {
 		manager.allocatedVolumes = make(map[string]*PoolVolume)
@@ -557,6 +560,7 @@ func (manager *fakeServiceManager) CreateVolumePoolVolume(ctx context.Context, p
 		IpAddress: "10.1.1.1",
 		MountName: fmt.Sprintf("vol_%s", volumeID),
 		State:     VolumePoolVolumeStateHot,
+		IpAcls:    defaultVolumePoolIpAcls(),
 	}
 	manager.allocatedVolumes[volumeURI] = vol
 	return copyPoolVolume(vol), nil
@@ -585,7 +589,7 @@ func (manager *fakeServiceManager) GetVolumePoolVolume(ctx context.Context, name
 
 // CreateVolumePoolVolumeFromSource checks the request like the API does: the
 // volume must not exist yet, and the backup must be a READY backup of a volume
-// in the same volume pool. The new volume is HOT.
+// in the same volume pool. The new volume is HOT, with the default IP ACLs.
 func (manager *fakeServiceManager) CreateVolumePoolVolumeFromSource(ctx context.Context, parentPool, volumeID, backupName string) (*PoolVolume, error) {
 	if manager.allocatedVolumes == nil {
 		manager.allocatedVolumes = make(map[string]*PoolVolume)
@@ -611,6 +615,7 @@ func (manager *fakeServiceManager) CreateVolumePoolVolumeFromSource(ctx context.
 		IpAddress: "10.1.1.2",
 		MountName: fmt.Sprintf("vol_%s", volumeID),
 		State:     VolumePoolVolumeStateHot,
+		IpAcls:    defaultVolumePoolIpAcls(),
 	}
 	manager.allocatedVolumes[volumeURI] = vol
 	return copyPoolVolume(vol), nil
@@ -658,7 +663,100 @@ func (manager *fakeServiceManager) createVolumePoolBackup(backupInfo *BackupInfo
 	return backupToCreate, nil
 }
 
+// defaultVolumePoolIpAcls returns the IP ACLs that the API gives a new volume
+// when neither the request nor the volume pool's share sets any: read-write
+// access for all private IPv4 ranges.
+func defaultVolumePoolIpAcls() []VolumePoolNfsExportOptions {
+	return []VolumePoolNfsExportOptions{{
+		IpRanges:        []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
+		AccessMode:      VolumePoolAccessModeReadWrite,
+		SquashMode:      VolumePoolSquashModeNoRoot,
+		SecurityFlavors: []string{VolumePoolSecurityFlavorAuthSys},
+	}}
+}
+
 func copyPoolVolume(vol *PoolVolume) *PoolVolume {
 	c := *vol
+	c.IpAcls = copyVolumePoolAcls(vol.IpAcls)
 	return &c
+}
+
+// copyVolumePoolAcls returns a deep copy of acls.
+func copyVolumePoolAcls(acls []VolumePoolNfsExportOptions) []VolumePoolNfsExportOptions {
+	if acls == nil {
+		return nil
+	}
+	c := make([]VolumePoolNfsExportOptions, len(acls))
+	for i, acl := range acls {
+		c[i] = acl
+		c[i].IpRanges = append([]string(nil), acl.IpRanges...)
+		c[i].SecurityFlavors = append([]string(nil), acl.SecurityFlavors...)
+	}
+	return c
+}
+
+// UpdateVolumePoolVolumeIpAcls replaces a volume's IP ACLs like the API does:
+// only HOT volumes (or volumes with no reported state) can be updated, and the
+// rules must be valid: every entry has IP ranges, which are IPv4, at most 64 in
+// all and no two equal, and anon IDs come only with ROOT_SQUASH. Like the API,
+// it compares IP ranges as networks, an address being a /32 one: x and x/32 are
+// equal, and so are 10.0.0.1/8 and 10.0.0.0/8, while ranges that only overlap,
+// such as 10.0.0.0/8 and 10.0.0.0/16, are allowed.
+func (manager *fakeServiceManager) UpdateVolumePoolVolumeIpAcls(ctx context.Context, name string, acls []VolumePoolNfsExportOptions) (*PoolVolume, error) {
+	vol, ok := manager.allocatedVolumes[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "volume %q not found", name)
+	}
+	switch vol.State {
+	case "", VolumePoolVolumeStateUnspecified, VolumePoolVolumeStateHot:
+	default:
+		return nil, status.Errorf(codes.FailedPrecondition, "fake: volume %q is %s; only HOT volumes can have their IP ACLs updated", name, vol.State)
+	}
+
+	var networks []string
+	for _, acl := range acls {
+		if len(acl.IpRanges) == 0 {
+			return nil, status.Error(codes.InvalidArgument, "fake: IP ranges must be set in NFS export options")
+		}
+		for _, r := range acl.IpRanges {
+			network, ok := ipv4Network(r)
+			if !ok {
+				return nil, status.Errorf(codes.InvalidArgument, "fake: %q is not an IPv4 address or range", r)
+			}
+			networks = append(networks, network)
+		}
+		if (acl.AnonUid != 0 || acl.AnonGid != 0) && acl.SquashMode != "ROOT_SQUASH" {
+			return nil, status.Errorf(codes.InvalidArgument, "fake: anon IDs require ROOT_SQUASH")
+		}
+	}
+	if len(networks) > 64 {
+		return nil, status.Errorf(codes.InvalidArgument, "fake: %d IP ranges, at most 64 are allowed", len(networks))
+	}
+	seen := map[string]bool{}
+	for _, network := range networks {
+		if seen[network] {
+			return nil, status.Errorf(codes.InvalidArgument, "fake: IP range %s was used multiple times, only one use is allowed", network)
+		}
+		seen[network] = true
+	}
+
+	vol.IpAcls = copyVolumePoolAcls(acls)
+	return copyPoolVolume(vol), nil
+}
+
+// ipv4Network returns the IPv4 address or range r as the network that the API
+// compares IP ranges as: an address is a /32 network, and a range is reduced to
+// its network address. ok is false if r isn't an IPv4 address or range.
+func ipv4Network(r string) (network string, ok bool) {
+	if ip := net.ParseIP(r); ip != nil {
+		if ip.To4() == nil {
+			return "", false
+		}
+		r += "/32"
+	}
+	ip, ipNet, err := net.ParseCIDR(r)
+	if err != nil || ip.To4() == nil {
+		return "", false
+	}
+	return ipNet.String(), true
 }
